@@ -24,7 +24,6 @@ from vllm_router.log import init_logger
 from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
 )
-from vllm_router.routers.routing_logic import reconfigure_routing_logic
 from vllm_router.service_discovery import (
     ServiceDiscoveryType,
     reconfigure_service_discovery,
@@ -204,11 +203,8 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         """
         Reconfigures the router with the given config.
         """
-        routing_logic = reconfigure_routing_logic(
-            config.routing_logic, session_key=config.session_key
-        )
-        self.app.state.router = routing_logic
-        logger.info("DynamicConfigWatcher: Routing logic reconfiguration complete")
+        # Routing logic reconfiguration not supported yet
+        pass
 
     def reconfigure_batch_api(self, config: DynamicRouterConfig):
         """

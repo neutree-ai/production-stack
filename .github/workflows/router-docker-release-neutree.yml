@@ -1,0 +1,105 @@
+name: Release Neutree Router Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "the release tag (e.g : v0.1.0-nightly-20250405)"
+        required: true
+        type: string
+      image_tag:
+        description: "the docker image tag (e.g : v0.1.0-nightly-20250405)"
+        required: true
+        type: string
+
+jobs:
+  build-amd64-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check out specific tag when manually triggered
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git fetch --all && git checkout ${{ github.event.inputs.tag }}
+
+      # Login to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: neutree
+          password: ${{ secrets.NEUTREE_DOCKER_SECRET }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          file: docker/Dockerfile.neutree
+          push: true
+          # Note: also push the image to Docker Hub as the helm chart uses it by default
+          tags: |
+            neutree/router-amd64:${{ github.event.inputs.image_tag }}
+  build-arm64-image:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check out specific tag when manually triggered
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git fetch --all && git checkout ${{ github.event.inputs.tag }}
+
+      # Login to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: neutree
+          password: ${{ secrets.NEUTREE_DOCKER_SECRET }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.neutree
+          platforms: linux/arm64
+          push: true
+          # Note: also push the image to Docker Hub as the helm chart uses it by default
+          tags: |
+            neutree/router-arm64:${{ github.event.inputs.image_tag }}
+  push-manifests:
+    runs-on: ubuntu-latest
+    name: merge and push manifests
+    needs:
+      - build-amd64-image
+      - build-arm64-image
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out specific tag when manually triggered
+        if: github.event_name == 'workflow_dispatch'
+        run: git fetch --all && git checkout ${{ github.event.inputs.tag }}
+      # Login to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: neutree
+          password: ${{ secrets.NEUTREE_DOCKER_SECRET }}
+      - name: Create and push manifest
+        run: |
+          docker manifest create --amend neutree/router:${{ github.event.inputs.image_tag }} \
+            neutree/router-amd64:${{ github.event.inputs.image_tag }} \
+            neutree/router-arm64:${{ github.event.inputs.image_tag }}
+          docker manifest annotate neutree/router:${{ github.event.inputs.image_tag }} \
+            neutree/router-amd64:${{ github.event.inputs.image_tag }} \
+            --arch amd64
+          docker manifest annotate neutree/router:${{ github.event.inputs.image_tag }} \
+            neutree/router-arm64:${{ github.event.inputs.image_tag }} \
+            --arch arm64
+          docker manifest push --purge neutree/router:${{ github.event.inputs.image_tag }}

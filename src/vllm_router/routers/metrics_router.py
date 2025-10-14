@@ -85,39 +85,54 @@ async def metrics():
     disk_percent = psutil.disk_usage("/").percent
     router_disk_usage_percent.set(disk_percent)
 
-    # Existing vLLM router request statistics
-    stats = get_request_stats_monitor().get_request_stats(time.time())
-    for server, stat in stats.items():
-        current_qps.labels(server=server).set(stat.qps)
-        avg_decoding_length.labels(server=server).set(stat.avg_decoding_length)
-        num_prefill_requests.labels(server=server).set(stat.in_prefill_requests)
-        num_decoding_requests.labels(server=server).set(stat.in_decoding_requests)
-        num_requests_running.labels(server=server).set(
-            stat.in_prefill_requests + stat.in_decoding_requests
-        )
-        avg_latency.labels(server=server).set(stat.avg_latency)
-        avg_itl.labels(server=server).set(stat.avg_itl)
-        num_requests_swapped.labels(server=server).set(stat.num_swapped_requests)
-
-    # Engine statistics (GPU prefix cache metrics)
-    engine_stats = get_engine_stats_scraper().get_engine_stats()
-    for server, engine_stat in engine_stats.items():
-        gpu_prefix_cache_hit_rate.labels(server=server).set(
-            engine_stat.gpu_prefix_cache_hit_rate
-        )
-        gpu_prefix_cache_hits_total.labels(server=server).set(
-            engine_stat.gpu_prefix_cache_hits_total
-        )
-        gpu_prefix_cache_queries_total.labels(server=server).set(
-            engine_stat.gpu_prefix_cache_queries_total
-        )
-
-    # Service discovery health status
     endpoints = get_service_discovery().get_endpoint_info()
+    stats = get_request_stats_monitor().get_request_stats(time.time())
+    healthy_pods_total.clear()
     for ep in endpoints:
-        healthy_pods_total.labels(server=ep.url).set(
-            1 if getattr(ep, "healthy", True) else 0
-        )
+        # set gpu cache metrics
+        if get_engine_stats_scraper() is not None:
+            engine_stat = get_engine_stats_scraper().engine_stats.get(ep.url, None)
+            if engine_stat:
+                gpu_prefix_cache_hit_rate.labels(
+                    workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+                ).set(engine_stat.gpu_prefix_cache_hit_rate)
+                gpu_prefix_cache_hits_total.labels(
+                    workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+                ).set(engine_stat.gpu_prefix_cache_hits_total)
+                gpu_prefix_cache_queries_total.labels(
+                    workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+                ).set(engine_stat.gpu_prefix_cache_queries_total)
+        # set healthy_pods_total metric
+        healthy_pods_total.labels(
+            workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+        ).set(1 if getattr(ep, "healthy", True) else 0)
+        # set request-related metrics
+        stat = stats.get(ep.url, None)
+        if stat:
+            current_qps.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.qps)
+            avg_decoding_length.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.avg_decoding_length)
+            num_prefill_requests.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.in_prefill_requests)
+            num_decoding_requests.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.in_decoding_requests)
+            num_requests_running.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.in_prefill_requests + stat.in_decoding_requests)
+            avg_latency.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.avg_latency)
+            avg_itl.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.avg_itl)
+            num_requests_swapped.labels(
+                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
+            ).set(stat.num_swapped_requests)
 
     # Return all metrics in Prometheus format
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

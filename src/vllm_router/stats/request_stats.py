@@ -14,7 +14,7 @@
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Tuple
+from typing import Deque, Dict, List, Set, Tuple
 
 from vllm_router.log import init_logger
 
@@ -53,6 +53,10 @@ class RequestStats:
     avg_itl: float
     # Number of swapped requests (moved from GPU to CPU)
     num_swapped_requests: int
+    # Total number of currently active requests being processed
+    active_requests: int
+    # List of active request IDs currently being processed
+    active_request_ids: List[str]
 
 
 class MovingAverageMonitor:
@@ -139,6 +143,9 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
         # Counter for swapped requests
         self.swapped_requests: Dict[str, int] = {}
 
+        # Track active requests per engine (engine_url -> Set of request_ids)
+        self.active_requests: Dict[str, Set[str]] = {}
+
         self.first_query_time: float = None
         self._initialized = True
 
@@ -167,6 +174,11 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             self.latency_monitors[engine_url] = MovingAverageMonitor(
                 self.sliding_window_size
             )
+
+        # Track this request as active
+        if engine_url not in self.active_requests:
+            self.active_requests[engine_url] = set()
+        self.active_requests[engine_url].add(request_id)
 
         if self.first_query_time is None:
             self.first_query_time = timestamp
@@ -220,6 +232,10 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             self.latency_monitors[engine_url].update(
                 timestamp, time.time() - request_start_time
             )
+
+        # Remove from active requests
+        if engine_url in self.active_requests:
+            self.active_requests[engine_url].discard(request_id)
 
     def on_request_swapped(self, engine_url: str, request_id: str, timestamp: float):
         # This function should be called if a request is determined to be swapped from GPU to CPU.
@@ -289,6 +305,14 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             else:
                 swapped = 0
 
+            # Get active requests information
+            if engine_url in self.active_requests:
+                active_count = len(self.active_requests[engine_url])
+                active_ids = list(self.active_requests[engine_url])
+            else:
+                active_count = 0
+                active_ids = []
+
             ret[engine_url] = RequestStats(
                 qps=qps,
                 ttft=ttft,
@@ -302,8 +326,56 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
                 avg_latency=avg_lat,
                 avg_itl=avg_itl_val,
                 num_swapped_requests=swapped,
+                active_requests=active_count,
+                active_request_ids=active_ids,
             )
         return ret
+
+    def get_active_requests(self, engine_url: str) -> Set[str]:
+        """
+        Get the set of currently active request IDs for a specific engine.
+
+        Args:
+            engine_url: The URL of the serving engine
+
+        Returns:
+            A set of active request IDs, or an empty set if no active requests
+        """
+        return self.active_requests.get(engine_url, set()).copy()
+
+    def get_active_request_count(self, engine_url: str) -> int:
+        """
+        Get the count of currently active requests for a specific engine.
+
+        Args:
+            engine_url: The URL of the serving engine
+
+        Returns:
+            The number of active requests
+        """
+        return len(self.active_requests.get(engine_url, set()))
+
+    def is_request_active(self, engine_url: str, request_id: str) -> bool:
+        """
+        Check if a specific request is currently active.
+
+        Args:
+            engine_url: The URL of the serving engine
+            request_id: The global request ID
+
+        Returns:
+            True if the request is active, False otherwise
+        """
+        return request_id in self.active_requests.get(engine_url, set())
+
+    def get_all_active_requests(self) -> Dict[str, Set[str]]:
+        """
+        Get all active requests for all engines.
+
+        Returns:
+            A dictionary mapping engine URLs to sets of active request IDs
+        """
+        return {url: requests.copy() for url, requests in self.active_requests.items()}
 
 
 def initialize_request_stats_monitor(sliding_window_size: float):
