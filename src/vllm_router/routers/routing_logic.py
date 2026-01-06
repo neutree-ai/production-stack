@@ -1183,7 +1183,6 @@ class StaticHashRouter(RoutingInterface):
             engine_name: Name of the engine/pod
             endpoint_info: Endpoint information (may be None for DELETED events)
         """
-        from vllm_router.service_discovery import ServiceDiscoveryEventType
 
         if endpoint_info:
             # Filter: only process endpoints matching this router's strategy
@@ -1228,22 +1227,6 @@ class StaticHashRouter(RoutingInterface):
                             logger.warning(
                                 f"StaticHashRouter: Tried to remove non-existent replica {endpoint_info.url}"
                             )
-            else:
-                # endpoint_info is None, remove by matching engine name from pod_name
-                # Need to iterate all states - use creation lock to get snapshot
-                with self._states_creation_lock:
-                    states_snapshot = list(self._replica_states.items())
-
-                for routing_key, state in states_snapshot:
-                    with state.lock:
-                        state.replica_list = [
-                            ep
-                            for ep in state.replica_list
-                            if ep.pod_name != engine_name
-                        ]
-                logger.info(
-                    f"StaticHashRouter: Removed replica by name {engine_name} from all routing keys"
-                )
 
     def _get_routing_key(self, endpoint_info: EndpointInfo) -> str:
         """
@@ -1506,6 +1489,7 @@ def get_routing_logic_by_type(routing_logic: RoutingLogic) -> RoutingInterface:
     raise ValueError(
         f"The router of type {routing_logic.value} has not been initialized"
     )
+
 
 def cleanup_routing_logic():
     """Clean up all routing logic instances."""

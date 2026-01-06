@@ -1,6 +1,8 @@
 # Neutree Router
 
 > **Note**: This project is based on [vLLM Production Stack v0.1.8](https://github.com/vllm-project/production-stack/tree/vllm-stack-0.1.8) and has been customized to meet Neutree's extension requirements. Key enhancements have been made to routing capabilities and customization features while maintaining compatibility with the original architecture.
+>
+> **⚠️ Important**: Due to significant customizations in the routing layer, this version is **not compatible with direct upgrades** from the native vLLM Production Stack router. Migration from the original router may require configuration adjustments.
 
 # vLLM Production Stack: reference stack for production vLLM deployment
 

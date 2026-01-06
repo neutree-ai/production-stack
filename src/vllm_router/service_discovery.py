@@ -131,7 +131,7 @@ class EndpointInfo:
     routing_logic: Optional[str] = None
 
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic})"
 
     def get_base_models(self) -> List[str]:
         """

@@ -154,34 +154,22 @@ async def route_score(
     )
 
 
-@main_router.post("/{workspace}/{endpoint}/sleep")
-async def route_sleep(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
-):
-    return await route_sleep_wakeup_request(
-        request, "/sleep", background_tasks, workspace, endpoint
-    )
+@main_router.post("/sleep")
+async def route_sleep(request: Request, background_tasks: BackgroundTasks):
+    return await route_sleep_wakeup_request(request, "/sleep", background_tasks)
 
 
-@main_router.post("/{workspace}/{endpoint}/wake_up")
-async def route_wake_up(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
-):
-    return await route_sleep_wakeup_request(
-        request, "/wake_up", background_tasks, workspace, endpoint
-    )
+@main_router.post("/wake_up")
+async def route_wake_up(request: Request, background_tasks: BackgroundTasks):
+    return await route_sleep_wakeup_request(request, "/wake_up", background_tasks)
 
 
-@main_router.get("/{workspace}/{endpoint}/is_sleeping")
-async def route_is_sleeping(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
-):
+@main_router.get("/is_sleeping")
+async def route_is_sleeping(request: Request, background_tasks: BackgroundTasks):
     return await route_sleep_wakeup_request(
         request,
         "/is_sleeping",
         background_tasks,
-        workspace,
-        endpoint,
     )
 
 

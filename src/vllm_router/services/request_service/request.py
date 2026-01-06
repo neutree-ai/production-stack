@@ -31,6 +31,7 @@ from vllm_router.routers.routing_logic import (
     KvawareRouter,
     PrefixAwareRouter,
     RoundRobinRouter,
+    RoutingLogic,
     SessionRouter,
     StaticHashRouter,
     get_routing_logic_by_type,
@@ -312,7 +313,9 @@ async def route_general_request(
         )
 
     routing_logic = (
-        endpoints[0].routing_logic if endpoints[0].routing_logic else "roundrobin"
+        endpoints[0].routing_logic
+        if endpoints[0].routing_logic
+        else RoutingLogic.ROUND_ROBIN
     )
     router = get_routing_logic_by_type(routing_logic)
 
@@ -327,7 +330,7 @@ async def route_general_request(
             RoundRobinRouter,
         ),
     ):
-        server_url = await request.app.state.router.route_request(
+        server_url = await router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
         )
     else:

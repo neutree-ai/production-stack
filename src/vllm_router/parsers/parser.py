@@ -270,7 +270,9 @@ def parse_args():
 
     # Monitoring
     parser.add_argument(
-        "--engine-stats", action="store_true", help="engine statistics periodically."
+        "--engine-stats",
+        action="store_true",
+        help="Enable scraping engine statistics periodically.",
     )
     parser.add_argument(
         "--engine-stats-interval",
