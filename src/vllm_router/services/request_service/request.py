@@ -30,7 +30,6 @@ from vllm_router.routers.routing_logic import (
     DisaggregatedPrefillRouter,
     KvawareRouter,
     PrefixAwareRouter,
-    RoundRobinRouter,
     RoutingLogic,
     SessionRouter,
     StaticHashRouter,
@@ -327,7 +326,6 @@ async def route_general_request(
             SessionRouter,
             ConsistentHashRouter,
             StaticHashRouter,
-            RoundRobinRouter,
         ),
     ):
         server_url = await router.route_request(
@@ -345,9 +343,7 @@ async def route_general_request(
     session_id_display = session_id if session_id is not None else "None"
 
     # Debug logging to help troubleshoot session ID extraction
-    logger.debug(
-        f"Debug session extraction - Router type: {type(request.app.state.router).__name__}"
-    )
+    logger.debug(f"Debug session extraction - Router type: {type(router).__name__}")
     logger.debug(f"Debug session extraction - Session key config: {session_key}")
     logger.debug(f"Debug session extraction - Request headers: {dict(request.headers)}")
     logger.debug(f"Debug session extraction - Extracted session ID: {session_id}")
