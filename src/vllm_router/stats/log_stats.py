@@ -75,15 +75,15 @@ def log_stats(app: FastAPI, interval: int = 10):
                     f"Queued Requests: {es.num_queuing_requests}, "
                     f"GPU Cache Hit Rate: {es.gpu_prefix_cache_hit_rate:.2f}\n"
                 )
-                gpu_prefix_cache_hit_rate.labels(server=url).set(
-                    es.gpu_prefix_cache_hit_rate
-                )
-                gpu_prefix_cache_hits_total.labels(server=url).set(
-                    es.gpu_prefix_cache_hits_total
-                )
-                gpu_prefix_cache_queries_total.labels(server=url).set(
-                    es.gpu_prefix_cache_queries_total
-                )
+                gpu_prefix_cache_hit_rate.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(es.gpu_prefix_cache_hit_rate)
+                gpu_prefix_cache_hits_total.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(es.gpu_prefix_cache_hits_total)
+                gpu_prefix_cache_queries_total.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(es.gpu_prefix_cache_queries_total)
             else:
                 logstr += " Engine Stats: No stats available\n"
             if url in request_stats:
@@ -98,16 +98,30 @@ def log_stats(app: FastAPI, interval: int = 10):
                     f"Finished: {rs.finished_requests}, "
                     f"Uptime: {rs.uptime:.2f} sec\n"
                 )
-                current_qps.labels(server=url).set(rs.qps)
-                avg_decoding_length.labels(server=url).set(rs.avg_decoding_length)
-                num_prefill_requests.labels(server=url).set(rs.in_prefill_requests)
-                num_decoding_requests.labels(server=url).set(rs.in_decoding_requests)
-                num_requests_running.labels(server=url).set(
-                    rs.in_prefill_requests + rs.in_decoding_requests
-                )
-                avg_latency.labels(server=url).set(rs.avg_latency)
-                avg_itl.labels(server=url).set(rs.avg_itl)
-                num_requests_swapped.labels(server=url).set(rs.num_swapped_requests)
+                current_qps.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.qps)
+                avg_decoding_length.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.avg_decoding_length)
+                num_prefill_requests.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.in_prefill_requests)
+                num_decoding_requests.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.in_decoding_requests)
+                num_requests_running.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.in_prefill_requests + rs.in_decoding_requests)
+                avg_latency.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.avg_latency)
+                avg_itl.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.avg_itl)
+                num_requests_swapped.labels(
+                    workspace=endpoint.workspace, endpoint=endpoint.endpoint, server=url
+                ).set(rs.num_swapped_requests)
             else:
                 logstr += " Request Stats: No stats available\n"
             logstr += "-" * 50 + "\n"

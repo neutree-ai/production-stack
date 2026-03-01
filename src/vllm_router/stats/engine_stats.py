@@ -214,5 +214,6 @@ def initialize_engine_stats_scraper(scrape_interval: float) -> EngineStatsScrape
 
 
 def get_engine_stats_scraper() -> EngineStatsScraper:
-    # This call returns the already-initialized instance (or raises an error if not yet initialized)
-    return EngineStatsScraper()
+    # Now we will use vmagent collect metrics instead of create a new scraper,
+    # so we set _create to False to avoid raise error.
+    return EngineStatsScraper(_create=False)

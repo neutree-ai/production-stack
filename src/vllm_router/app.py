@@ -33,6 +33,8 @@ from vllm_router.routers.files_router import files_router
 from vllm_router.routers.main_router import main_router
 from vllm_router.routers.metrics_router import metrics_router
 from vllm_router.routers.routing_logic import (
+    AllInitRoutingLogics,
+    DefaultInitRoutingLogics,
     cleanup_routing_logic,
     get_routing_logic,
     initialize_routing_logic,
@@ -99,8 +101,8 @@ async def lifespan(app: FastAPI):
 
     # Close the threaded-components
     logger.info("Closing engine stats scraper")
-    engine_stats_scraper = get_engine_stats_scraper()
-    engine_stats_scraper.close()
+    if app.state.engine_stats_scraper is not None:
+        app.state.engine_stats_scraper.close()
 
     logger.info("Closing service discovery module")
     service_discovery = get_service_discovery()
@@ -180,7 +182,9 @@ def initialize_all(app: FastAPI, args):
         raise ValueError(f"Invalid service discovery type: {args.service_discovery}")
 
     # Initialize singletons via custom functions.
-    initialize_engine_stats_scraper(args.engine_stats_interval)
+    if args.engine_stats:
+        initialize_engine_stats_scraper(args.engine_stats_interval)
+
     initialize_request_stats_monitor(args.request_stats_window)
 
     if args.enable_batch_api:
@@ -207,14 +211,53 @@ def initialize_all(app: FastAPI, args):
     if args.callbacks:
         configure_custom_callbacks(args.callbacks, app)
 
-    initialize_routing_logic(
-        args.routing_logic,
-        session_key=args.session_key,
-        lmcache_controller_port=args.lmcache_controller_port,
-        prefill_model_labels=args.prefill_model_labels,
-        decode_model_labels=args.decode_model_labels,
-        kv_aware_threshold=args.kv_aware_threshold,
-    )
+    # Initialize routing logic components
+    # Note: Multiple routing strategies are initialized to support dynamic switching
+    # Each router maintains its own state and can be retrieved via get_routing_logic()
+    #
+    # Routing strategies overview:
+    # - RoundRobinRouter: Simple round-robin distribution across replicas
+    # - SessionRouter: Session-based routing using consistent hashing (requires session_key)
+    # - PrefixAwareRouter: Routes based on longest prefix match for cache efficiency
+    # - DisaggregatedPrefillRouter: Separate prefill and decode endpoints
+    # - ConsistentHashRouter: Payload-based consistent hashing with bounded loads
+    #   * Supports multi-tenant isolation via workspace+endpoint keys
+    #   * Uses virtual nodes (default: 100 per replica) for load distribution
+    #   * Load factor threshold (default: 1.25) prevents overloading
+    #   * Cache key extraction from system prompt + user messages
+    # - StaticHashRouter: Simple deterministic hash-based routing (payload hash % replica_count)
+    #   * Supports multi-tenant isolation via workspace+endpoint keys
+    #   * No virtual nodes or load balancing - purely deterministic
+    #
+    # Multi-tenant isolation: ConsistentHashRouter and StaticHashRouter automatically
+    # maintain separate hash rings/replica lists per (workspace, endpoint) combination,
+    # preventing cross-tenant routing conflicts in multi-model deployments.
+
+    # Default initialization of required routing logics
+    for logic in DefaultInitRoutingLogics:
+        initialize_routing_logic(
+            logic,
+            session_key=args.session_key,
+            lmcache_controller_port=args.lmcache_controller_port,
+            prefill_model_labels=args.prefill_model_labels,
+            decode_model_labels=args.decode_model_labels,
+            kv_aware_threshold=args.kv_aware_threshold,
+            # ConsistentHashRouter parameters (if applicable)
+            # virtual_nodes_per_replica, load_factor, max_user_messages_for_cache
+            # are set to defaults in the router constructor
+        )
+
+    # Initialize all routing logics if requested
+    if args.routing_logic == "all":
+        for logic in AllInitRoutingLogics:
+            initialize_routing_logic(
+                logic,
+                session_key=args.session_key,
+                lmcache_controller_port=args.lmcache_controller_port,
+                prefill_model_labels=args.prefill_model_labels,
+                decode_model_labels=args.decode_model_labels,
+                kv_aware_threshold=args.kv_aware_threshold,
+            )
 
     # Initialize feature gates
     initialize_feature_gates(args.feature_gates)

@@ -47,8 +47,10 @@ main_router = APIRouter()
 logger = init_logger(__name__)
 
 
-@main_router.post("/v1/chat/completions")
-async def route_chat_completion(request: Request, background_tasks: BackgroundTasks):
+@main_router.post("/{workspace}/{endpoint}/v1/chat/completions")
+async def route_chat_completion(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
     if semantic_cache_available:
         # Check if the request can be served from the semantic cache
         logger.debug("Received chat completion request, checking semantic cache")
@@ -60,48 +62,96 @@ async def route_chat_completion(request: Request, background_tasks: BackgroundTa
 
     logger.debug("No cache hit, forwarding request to backend")
     return await route_general_request(
-        request, "/v1/chat/completions", background_tasks
+        request,
+        "/v1/chat/completions",
+        background_tasks,
+        workspace,
+        endpoint,
     )
 
 
-@main_router.post("/v1/completions")
-async def route_completion(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/v1/completions", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/v1/completions")
+async def route_completion(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request,
+        "/v1/completions",
+        background_tasks,
+        workspace,
+        endpoint,
+    )
 
 
-@main_router.post("/v1/embeddings")
-async def route_embeddings(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/v1/embeddings", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/v1/embeddings")
+async def route_embeddings(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request,
+        "/v1/embeddings",
+        background_tasks,
+        workspace,
+        endpoint,
+    )
 
 
-@main_router.post("/tokenize")
-async def route_tokenize(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/tokenize", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/tokenize")
+async def route_tokenize(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/tokenize", background_tasks, workspace, endpoint
+    )
 
 
-@main_router.post("/detokenize")
-async def route_detokenize(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/detokenize", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/detokenize")
+async def route_detokenize(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request,
+        "/detokenize",
+        background_tasks,
+        workspace,
+        endpoint,
+    )
 
 
-@main_router.post("/v1/rerank")
-async def route_v1_rerank(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/v1/rerank", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/v1/rerank")
+async def route_v1_rerank(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/v1/rerank", background_tasks, workspace, endpoint
+    )
 
 
-@main_router.post("/rerank")
-async def route_rerank(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/rerank", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/rerank")
+async def route_rerank(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/rerank", background_tasks, workspace, endpoint
+    )
 
 
-@main_router.post("/v1/score")
-async def route_v1_score(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/v1/score", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/v1/score")
+async def route_v1_score(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/v1/score", background_tasks, workspace, endpoint
+    )
 
 
-@main_router.post("/score")
-async def route_score(request: Request, background_tasks: BackgroundTasks):
-    return await route_general_request(request, "/score", background_tasks)
+@main_router.post("/{workspace}/{endpoint}/score")
+async def route_score(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/score", background_tasks, workspace, endpoint
+    )
 
 
 @main_router.post("/sleep")
@@ -116,7 +166,11 @@ async def route_wake_up(request: Request, background_tasks: BackgroundTasks):
 
 @main_router.get("/is_sleeping")
 async def route_is_sleeping(request: Request, background_tasks: BackgroundTasks):
-    return await route_sleep_wakeup_request(request, "/is_sleeping", background_tasks)
+    return await route_sleep_wakeup_request(
+        request,
+        "/is_sleeping",
+        background_tasks,
+    )
 
 
 @main_router.get("/version")
@@ -125,8 +179,8 @@ async def show_version():
     return JSONResponse(content=ver)
 
 
-@main_router.get("/v1/models")
-async def show_models():
+@main_router.get("/{workspace}/{endpoint}/v1/models")
+async def show_models(workspace: str, endpoint: str):
     """
     Returns a list of all models available in the stack.
 
@@ -143,11 +197,12 @@ async def show_models():
     existing_models = set()
     model_cards = []
 
-    for endpoint in endpoints:
-        if not endpoint.model_info:
+    for ep in endpoints:
+        if not ep.model_info:
             continue
-
-        for model_id, model_info in endpoint.model_info.items():
+        if ep.workspace != workspace or ep.endpoint != endpoint:
+            continue
+        for model_id, model_info in ep.model_info.items():
             if model_id in existing_models:
                 continue
 
@@ -163,6 +218,24 @@ async def show_models():
 
     model_list = ModelList(data=model_cards)
     return JSONResponse(content=model_list.model_dump())
+
+
+@main_router.get("/{workspace}/{endpoint}/health")
+async def endpoint_health(workspace: str, endpoint: str) -> Response:
+    """
+    Endpoint to check the health status of a specific endpoint.
+    """
+
+    endpoints = get_service_discovery().get_endpoint_info()
+    for ep in endpoints:
+        if ep.workspace != workspace or ep.endpoint != endpoint:
+            continue
+        return JSONResponse(content={"status": "healthy"}, status_code=200)
+
+    return JSONResponse(
+        content={"status": f"Endpoint {workspace}/{endpoint} not found."},
+        status_code=404,
+    )
 
 
 @main_router.get("/engines")
@@ -218,10 +291,11 @@ async def health() -> Response:
         return JSONResponse(
             content={"status": "Service discovery module is down."}, status_code=503
         )
-    if not get_engine_stats_scraper().get_health():
-        return JSONResponse(
-            content={"status": "Engine stats scraper is down."}, status_code=503
-        )
+    if get_engine_stats_scraper() is not None:
+        if not get_engine_stats_scraper().get_health():
+            return JSONResponse(
+                content={"status": "Engine stats scraper is down."}, status_code=503
+            )
 
     if get_dynamic_config_watcher() is not None:
         dynamic_config = get_dynamic_config_watcher().get_current_config()

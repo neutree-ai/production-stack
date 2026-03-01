@@ -3,50 +3,72 @@ from prometheus_client import Counter, Gauge
 # --- Prometheus Gauges ---
 # Existing metrics
 num_requests_running = Gauge(
-    "vllm:num_requests_running", "Number of running requests", ["server"]
+    "router:num_requests_running",
+    "Number of running requests",
+    ["workspace", "endpoint", "server"],
 )
 num_requests_waiting = Gauge(
-    "vllm:num_requests_waiting", "Number of waiting requests", ["server"]
+    "router:num_requests_waiting",
+    "Number of waiting requests",
+    ["workspace", "endpoint", "server"],
 )
 gpu_prefix_cache_hit_rate = Gauge(
-    "vllm:gpu_prefix_cache_hit_rate",
+    "router:gpu_prefix_cache_hit_rate",
     "GPU Prefix Cache Hit Rate",
-    ["server"],
+    ["workspace", "endpoint", "server"],
 )
 gpu_prefix_cache_hits_total = Gauge(
-    "vllm:gpu_prefix_cache_hits_total",
+    "router:gpu_prefix_cache_hits_total",
     "Total GPU Prefix Cache Hits",
-    ["server"],
+    ["workspace", "endpoint", "server"],
 )
 gpu_prefix_cache_queries_total = Gauge(
-    "vllm:gpu_prefix_cache_queries_total",
+    "router:gpu_prefix_cache_queries_total",
     "Total GPU Prefix Cache Queries",
-    ["server"],
+    ["workspace", "endpoint", "server"],
 )
-current_qps = Gauge("vllm:current_qps", "Current Queries Per Second", ["server"])
+current_qps = Gauge(
+    "router:current_qps",
+    "Current Queries Per Second",
+    ["workspace", "endpoint", "server"],
+)
 avg_decoding_length = Gauge(
-    "vllm:avg_decoding_length", "Average Decoding Length", ["server"]
+    "router:avg_decoding_length",
+    "Average Decoding Length",
+    ["workspace", "endpoint", "server"],
 )
 num_prefill_requests = Gauge(
-    "vllm:num_prefill_requests", "Number of Prefill Requests", ["server"]
+    "router:num_prefill_requests",
+    "Number of Prefill Requests",
+    ["workspace", "endpoint", "server"],
 )
 num_decoding_requests = Gauge(
-    "vllm:num_decoding_requests", "Number of Decoding Requests", ["server"]
+    "router:num_decoding_requests",
+    "Number of Decoding Requests",
+    ["workspace", "endpoint", "server"],
 )
 num_incoming_requests_total = Counter(
-    "vllm:num_incoming_requests",
+    "router:num_incoming_requests",
     "Total valid incoming requests to router (including when no backends available).",
-    ["model"],
+    ["workspace", "endpoint"],
 )
 
 # New metrics per dashboard update
 healthy_pods_total = Gauge(
-    "vllm:healthy_pods_total", "Number of healthy vLLM pods", ["server"]
+    "router:healthy_pods_total",
+    "Number of healthy inference pods",
+    ["workspace", "endpoint", "server"],
 )
 avg_latency = Gauge(
-    "vllm:avg_latency", "Average end-to-end request latency", ["server"]
+    "router:avg_latency",
+    "Average end-to-end request latency",
+    ["workspace", "endpoint", "server"],
 )
-avg_itl = Gauge("vllm:avg_itl", "Average Inter-Token Latency", ["server"])
+avg_itl = Gauge(
+    "router:avg_itl", "Average Inter-Token Latency", ["workspace", "endpoint", "server"]
+)
 num_requests_swapped = Gauge(
-    "vllm:num_requests_swapped", "Number of swapped requests", ["server"]
+    "router:num_requests_swapped",
+    "Number of swapped requests",
+    ["workspace", "endpoint", "server"],
 )

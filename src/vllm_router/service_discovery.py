@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 import aiohttp
 import requests
@@ -37,6 +37,18 @@ _global_service_discovery: "Optional[ServiceDiscovery]" = None
 class ServiceDiscoveryType(enum.Enum):
     STATIC = "static"
     K8S = "k8s"
+
+
+class ServiceDiscoveryEventType(enum.Enum):
+    """Event types for service discovery callbacks.
+
+    Only two events are needed for simple routing logic:
+    - ENGINE_ADDED: Engine becomes available (pod is ready and healthy)
+    - ENGINE_DELETED: Engine becomes unavailable (pod deleted or not ready)
+    """
+
+    ENGINE_ADDED = "engine_added"
+    ENGINE_DELETED = "engine_deleted"
 
 
 @dataclass
@@ -109,8 +121,17 @@ class EndpointInfo:
     # Model information including relationships
     model_info: Dict[str, ModelInfo] = None
 
+    # Workspace
+    workspace: Optional[str] = None
+
+    # Endpoint
+    endpoint: Optional[str] = None
+
+    # Routing logic
+    routing_logic: Optional[str] = None
+
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic})"
 
     def get_base_models(self) -> List[str]:
         """
@@ -173,6 +194,11 @@ class EndpointInfo:
         if not self.model_info:
             return None
         return self.model_info.get(model_id)
+
+
+# Type definition for event callback function
+# Callback receives: event_type, engine_name, endpoint_info (optional)
+EventCallback = Callable[[ServiceDiscoveryEventType, str, Optional[EndpointInfo]], None]
 
 
 class ServiceDiscovery(metaclass=abc.ABCMeta):
@@ -390,6 +416,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         decode_model_labels: List[str] | None = None,
         watcher_timeout_seconds: int = 0,
         health_check_timeout_seconds: int = 10,
+        event_callbacks: List[EventCallback] | None = None,
     ):
         """
         Initialize the Kubernetes service discovery module. This module
@@ -404,6 +431,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             port: the port of the engines
             label_selector: the label selector of the engines
             watcher_timeout_seconds: timeout in seconds for Kubernetes watcher streams (default: 0)
+            event_callbacks: list of callback functions to be invoked on service discovery events
         """
         self.app = app
         self.namespace = namespace
@@ -415,6 +443,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         self.label_selector = label_selector
         self.watcher_timeout_seconds = watcher_timeout_seconds
         self.health_check_timeout_seconds = health_check_timeout_seconds
+        self.event_callbacks = event_callbacks or []
 
         # Init kubernetes watcher
         try:
@@ -431,6 +460,50 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         self.watcher_thread.start()
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
+
+    def _trigger_callbacks(
+        self,
+        event_type: ServiceDiscoveryEventType,
+        engine_name: str,
+        endpoint_info: Optional[EndpointInfo] = None,
+    ) -> None:
+        """
+        Trigger all registered event callbacks.
+
+        Args:
+            event_type: the type of event that occurred
+            engine_name: the name of the engine
+            endpoint_info: optional endpoint information
+        """
+        for callback in self.event_callbacks:
+            try:
+                callback(event_type, engine_name, endpoint_info)
+            except Exception as e:
+                logger.error(
+                    f"Error executing callback for event {event_type} on engine {engine_name}: {e}"
+                )
+
+    def register_callback(self, callback: EventCallback) -> None:
+        """
+        Register a new event callback.
+
+        Args:
+            callback: the callback function to register
+        """
+        if callback not in self.event_callbacks:
+            self.event_callbacks.append(callback)
+            logger.info(f"Registered new event callback: {callback.__name__}")
+
+    def unregister_callback(self, callback: EventCallback) -> None:
+        """
+        Unregister an event callback.
+
+        Args:
+            callback: the callback function to unregister
+        """
+        if callback in self.event_callbacks:
+            self.event_callbacks.remove(callback)
+            logger.info(f"Unregistered event callback: {callback.__name__}")
 
     @staticmethod
     def _check_pod_ready(container_statuses):
@@ -618,6 +691,48 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return pod.metadata.labels.get("model")
 
+    def _get_workspace(self, pod) -> Optional[str]:
+        """
+        Get the workspace from the pod's metadata labels.
+
+        Args:
+            pod: The Kubernetes pod object
+
+        Returns:
+            The workspace if found, None otherwise
+        """
+        if not pod.metadata.labels:
+            return None
+        return pod.metadata.labels.get("workspace")
+
+    def _get_endpoint(self, pod) -> Optional[str]:
+        """
+        Get the endpoint from the pod's metadata labels.
+
+        Args:
+            pod: The Kubernetes pod object
+
+        Returns:
+            The endpoint if found, None otherwise
+        """
+        if not pod.metadata.labels:
+            return None
+        return pod.metadata.labels.get("endpoint")
+
+    def _get_routing_logic(self, pod) -> Optional[str]:
+        """
+        Get the routing logic from the pod's metadata labels.
+
+        Args:
+            pod: The Kubernetes pod object
+
+        Returns:
+            The routing logic if found, None otherwise
+        """
+        if not pod.metadata.labels:
+            return None
+        return pod.metadata.labels.get("routing_logic")
+
     def _watch_engines(self):
         while self.running:
             try:
@@ -649,9 +764,15 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     if is_pod_ready:
                         model_names = self._get_model_names(pod_ip)
                         model_label = self._get_model_label(pod)
+                        workspace = self._get_workspace(pod)
+                        endpoint = self._get_endpoint(pod)
+                        routing_logic = self._get_routing_logic(pod)
                     else:
                         model_names = []
                         model_label = None
+                        workspace = None
+                        endpoint = None
+                        routing_logic = None
 
                     # Record pod status for debugging
                     if is_container_ready and is_pod_terminating:
@@ -666,13 +787,23 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         is_pod_ready,
                         model_names,
                         model_label,
+                        workspace,
+                        endpoint,
+                        routing_logic,
                     )
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
                 time.sleep(0.5)
 
     def _add_engine(
-        self, engine_name: str, engine_ip: str, model_names: List[str], model_label: str
+        self,
+        engine_name: str,
+        engine_ip: str,
+        model_names: List[str],
+        model_label: str,
+        workspace: str,
+        endpoint: str,
+        routing_logic: str,
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -699,10 +830,23 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 pod_name=engine_name,
                 namespace=self.namespace,
                 model_info=model_info,
+                workspace=workspace,
+                endpoint=endpoint,
+                routing_logic=routing_logic,
             )
 
             # Store model information in the endpoint info
             self.available_engines[engine_name].model_info = model_info
+
+            # Get the endpoint info for callback
+            endpoint_info = self.available_engines[engine_name]
+
+        # Trigger callbacks after releasing lock
+        self._trigger_callbacks(
+            ServiceDiscoveryEventType.ENGINE_ADDED,
+            engine_name,
+            endpoint_info,
+        )
 
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -720,7 +864,16 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
     def _delete_engine(self, engine_name: str):
         logger.info(f"Serving engine {engine_name} is deleted")
         with self.available_engines_lock:
+            # Get endpoint info before deletion for callback
+            endpoint_info = self.available_engines.get(engine_name)
             del self.available_engines[engine_name]
+
+        # Trigger callbacks after releasing lock
+        self._trigger_callbacks(
+            ServiceDiscoveryEventType.ENGINE_DELETED,
+            engine_name,
+            endpoint_info,
+        )
 
     def _on_engine_update(
         self,
@@ -730,18 +883,34 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         is_pod_ready: bool,
         model_names: List[str],
         model_label: Optional[str],
+        workspace: Optional[str],
+        endpoint: Optional[str],
+        routing_logic: Optional[str],
     ) -> None:
+        """
+        Handle engine update events from Kubernetes watcher.
+
+        Simple state machine:
+        - If pod becomes ready and healthy -> trigger ENGINE_ADDED
+        - If pod becomes unavailable (deleted or not ready) -> trigger ENGINE_DELETED
+        """
         if event == "ADDED":
             if engine_ip is None:
                 return
 
-            if not is_pod_ready:
+            # Only add engine if pod is ready and has models
+            if not is_pod_ready or not model_names:
                 return
 
-            if not model_names:
-                return
-
-            self._add_engine(engine_name, engine_ip, model_names, model_label)
+            self._add_engine(
+                engine_name,
+                engine_ip,
+                model_names,
+                model_label,
+                workspace,
+                endpoint,
+                routing_logic,
+            )
 
         elif event == "DELETED":
             if engine_name not in self.available_engines:
@@ -753,15 +922,24 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             if engine_ip is None:
                 return
 
-            if is_pod_ready and model_names:
-                self._add_engine(engine_name, engine_ip, model_names, model_label)
-                return
+            # Check if engine availability status changed
+            was_available = engine_name in self.available_engines
+            is_now_available = is_pod_ready and model_names
 
-            if (
-                not is_pod_ready or not model_names
-            ) and engine_name in self.available_engines:
+            if is_now_available and not was_available:
+                # Engine became available: trigger ENGINE_ADDED
+                self._add_engine(
+                    engine_name,
+                    engine_ip,
+                    model_names,
+                    model_label,
+                    workspace,
+                    endpoint,
+                    routing_logic,
+                )
+            elif not is_now_available and was_available:
+                # Engine became unavailable: trigger ENGINE_DELETED
                 self._delete_engine(engine_name)
-                return
 
     def get_endpoint_info(self) -> List[EndpointInfo]:
         """
@@ -1348,13 +1526,40 @@ def get_service_discovery() -> ServiceDiscovery:
 
 
 if __name__ == "__main__":
-    # Test the service discovery
+    # Test the service discovery with event callbacks
+
+    # Define a sample callback function
+    def on_engine_event(
+        event_type: ServiceDiscoveryEventType,
+        engine_name: str,
+        endpoint_info: Optional[EndpointInfo],
+    ) -> None:
+        """Sample callback function to handle service discovery events."""
+        print(f"[CALLBACK] Event: {event_type.value}, Engine: {engine_name}")
+        if endpoint_info:
+            print(f"[CALLBACK] Endpoint URL: {endpoint_info.url}")
+            print(f"[CALLBACK] Models: {endpoint_info.model_names}")
+            print(f"[CALLBACK] Model Label: {endpoint_info.model_label}")
+        print("-" * 50)
+
+    # Define another callback for logging
+    def log_engine_event(
+        event_type: ServiceDiscoveryEventType,
+        engine_name: str,
+        endpoint_info: Optional[EndpointInfo],
+    ) -> None:
+        """Log engine events to a file or monitoring system."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_msg = f"[{timestamp}] {event_type.value}: {engine_name}"
+        print(f"[LOG] {log_msg}")
+
     # k8s_sd = K8sServiceDiscovery("default", 8000, "release=test")
     initialize_service_discovery(
         ServiceDiscoveryType.K8S,
         namespace="default",
         port=8000,
         label_selector="release=test",
+        event_callbacks=[on_engine_event, log_engine_event],
     )
 
     k8s_sd = get_service_discovery()
@@ -1362,5 +1567,7 @@ if __name__ == "__main__":
     time.sleep(1)
     while True:
         urls = k8s_sd.get_endpoint_info()
-        print(urls)
+        print(f"\n[MAIN] Current endpoints: {len(urls)}")
+        for endpoint in urls:
+            print(f"  - {endpoint.url} (models: {endpoint.model_names})")
         time.sleep(2)

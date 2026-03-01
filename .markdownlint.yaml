@@ -3,3 +3,4 @@ MD028: false # no-blanks-blockquote
 MD029: # ol-prefix
   style: ordered
 MD033: false # no-inline-html
+MD025: false # single-title

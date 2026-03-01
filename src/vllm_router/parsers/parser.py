@@ -203,14 +203,14 @@ def parse_args():
     parser.add_argument(
         "--routing-logic",
         type=str,
-        choices=[
-            "roundrobin",
-            "session",
-            "kvaware",
-            "prefixaware",
-            "disaggregated_prefill",
-        ],
-        help="The routing logic to use",
+        choices=["default", "all"],
+        default="default",
+        help=(
+            "The routing logic initialization mode. "
+            "'default': Pre-initialize standard routing strategies (roundrobin, session, prefixaware, "
+            "disaggregated_prefill, consistent_hash, static_hash) for dynamic switching at runtime. "
+            "'all': Additionally include 'kvaware' routing which requires lmcache dependencies."
+        ),
     )
     parser.add_argument(
         "--lmcache-controller-port",
@@ -269,6 +269,11 @@ def parse_args():
     )
 
     # Monitoring
+    parser.add_argument(
+        "--engine-stats",
+        action="store_true",
+        help="Enable scraping engine statistics periodically.",
+    )
     parser.add_argument(
         "--engine-stats-interval",
         type=int,
