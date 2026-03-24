@@ -40,6 +40,8 @@ jobs:
           platforms: linux/amd64
           file: docker/Dockerfile.neutree
           push: true
+          build-args: |
+            CLUSTER_VERSION=${{ github.event.inputs.image_tag }}
           # Note: also push the image to Docker Hub as the helm chart uses it by default
           tags: |
             neutree/router-amd64:${{ github.event.inputs.image_tag }}
@@ -70,6 +72,8 @@ jobs:
           file: docker/Dockerfile.neutree
           platforms: linux/arm64
           push: true
+          build-args: |
+            CLUSTER_VERSION=${{ github.event.inputs.image_tag }}
           # Note: also push the image to Docker Hub as the helm chart uses it by default
           tags: |
             neutree/router-arm64:${{ github.event.inputs.image_tag }}
