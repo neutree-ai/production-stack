@@ -29,6 +29,7 @@ from vllm_router.routers.routing_logic import (
     ConsistentHashRouter,
     DisaggregatedPrefillRouter,
     KvawareRouter,
+    PDRouter,
     PrefixAwareRouter,
     RoutingLogic,
     SessionRouter,
@@ -68,6 +69,12 @@ _HOP_BY_HOP_HEADERS = {
     "trailer",
 }
 
+_PD_ROUTE_HEADERS = {
+    "x-neutree-pd-role-group",
+    "x-neutree-pd-prefill-index",
+    "x-neutree-pd-decode-index",
+}
+
 
 # TODO: (Brian) check if request is json beforehand
 async def process_request(
@@ -78,6 +85,7 @@ async def process_request(
     endpoint,
     background_tasks: BackgroundTasks,
     debug_request=None,
+    route_headers: Optional[dict[str, str]] = None,
 ):
     """
     Process a request by sending it to the chosen backend.
@@ -113,8 +121,12 @@ async def process_request(
 
     # sanitize the request headers
     headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in _HOP_BY_HOP_HEADERS and k.lower() not in _PD_ROUTE_HEADERS
     }
+    if route_headers:
+        headers.update(route_headers)
 
     # For non-streaming requests, collect the full response to cache it properly
     full_response = bytearray()
@@ -326,15 +338,29 @@ async def route_general_request(
             SessionRouter,
             ConsistentHashRouter,
             StaticHashRouter,
+            PDRouter,
         ),
     ):
-        server_url = await router.route_request(
+        route_result = await router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
         )
     else:
-        server_url = router.route_request(
+        route_result = router.route_request(
             endpoints, engine_stats, request_stats, request
         )
+
+    route_headers = None
+    if route_result is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "No healthy route target is available for this request."},
+            headers={"X-Request-Id": request_id},
+        )
+    if hasattr(route_result, "url"):
+        server_url = route_result.url
+        route_headers = getattr(route_result, "headers", None)
+    else:
+        server_url = route_result
 
     curr_time = time.time()
     # Extract actual session ID from request headers for logging
@@ -358,6 +384,7 @@ async def route_general_request(
         request_id,
         endpoint,
         background_tasks,
+        route_headers=route_headers,
     )
     headers, status = await anext(stream_generator)
     headers_dict = {key: value for key, value in headers.items()}

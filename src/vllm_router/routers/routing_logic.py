@@ -18,6 +18,7 @@ import bisect
 import concurrent.futures
 import enum
 import hashlib
+import json
 import math
 import random
 import threading
@@ -63,6 +64,7 @@ class RoutingLogic(str, enum.Enum):
     KVAWARE = "kvaware"
     PREFIXAWARE = "prefixaware"
     DISAGGREGATED_PREFILL = "disaggregated_prefill"
+    PD = "pd"
     CONSISTENT_HASH = "consistent_hash"
     STATIC_HASH = "static_hash"
 
@@ -73,6 +75,7 @@ ROUTING_LOGIC_TO_CLASS = {
     RoutingLogic.KVAWARE: "KvawareRouter",
     RoutingLogic.PREFIXAWARE: "PrefixAwareRouter",
     RoutingLogic.DISAGGREGATED_PREFILL: "DisaggregatedPrefillRouter",
+    RoutingLogic.PD: "PDRouter",
     RoutingLogic.CONSISTENT_HASH: "ConsistentHashRouter",
     RoutingLogic.STATIC_HASH: "StaticHashRouter",
 }
@@ -82,6 +85,7 @@ DefaultInitRoutingLogics = [
     RoutingLogic.SESSION_BASED,
     RoutingLogic.PREFIXAWARE,
     RoutingLogic.DISAGGREGATED_PREFILL,
+    RoutingLogic.PD,
     RoutingLogic.CONSISTENT_HASH,
     RoutingLogic.STATIC_HASH,
 ]
@@ -547,6 +551,366 @@ class DisaggregatedPrefillRouter(RoutingInterface):
             return prefiller_endpoints[0].url
         else:
             return decoder_endpoints[0].url
+
+
+@dataclass(frozen=True)
+class RouteUnit:
+    """Logical P/D route target inside a RoleGroup."""
+
+    role_group_id: str
+    role: str
+    index: int
+    url: str
+    endpoint_info: EndpointInfo
+
+    @property
+    def unit_id(self) -> str:
+        return f"{self.role_group_id}:{self.role}:{self.index}:{self.url}"
+
+
+@dataclass(frozen=True)
+class PDRouteDecision:
+    """Final P/D route decision for a request."""
+
+    prefill: RouteUnit
+    decode: RouteUnit
+
+    @property
+    def url(self) -> str:
+        return self.decode.url
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        return {
+            "X-Neutree-PD-Role-Group": self.decode.role_group_id,
+            "X-Neutree-PD-Prefill-Index": str(self.prefill.index),
+            "X-Neutree-PD-Decode-Index": str(self.decode.index),
+        }
+
+
+@dataclass
+class PDRouterState:
+    """Encapsulates P/D route units for a workspace+endpoint combination."""
+
+    hash_to_decode_unit_id: Dict[int, str] = field(default_factory=dict)
+    sorted_hashes: List[int] = field(default_factory=list)
+    decode_units: Dict[str, RouteUnit] = field(default_factory=dict)
+    prefill_units_by_group: Dict[str, List[RouteUnit]] = field(default_factory=dict)
+    decode_unit_counts_by_url: Dict[str, int] = field(default_factory=dict)
+    last_sync_time: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class PDRouter(RoutingInterface):
+    """
+    Route collocated P/D requests by selecting decode first, then prefill in the same RoleGroup.
+
+    K8s service discovery provides one EndpointInfo per collocated Pod. Each Pod is
+    expanded into logical prefill/decode RouteUnits using the P/D metadata carried on
+    EndpointInfo. The selected Pod sidecar receives the chosen unit indices via
+    X-Neutree-PD-* headers.
+    """
+
+    def __init__(
+        self,
+        virtual_nodes_per_replica: int = 100,
+        load_factor: float = 1.25,
+        max_user_messages_for_cache: int = 2,
+    ):
+        if hasattr(self, "_initialized"):
+            return
+
+        self._virtual_nodes = virtual_nodes_per_replica
+        self._load_factor = load_factor
+        self._max_user_messages_for_cache = max_user_messages_for_cache
+        self._states: Dict[str, PDRouterState] = {}
+        self._states_creation_lock = threading.Lock()
+        self._initialized = True
+
+        logger.info(
+            "Initialized PDRouter with %s virtual nodes per decode unit, "
+            "load factor %s, max_user_messages_for_cache=%s",
+            virtual_nodes_per_replica,
+            load_factor,
+            max_user_messages_for_cache,
+        )
+
+    def _get_routing_key(self, endpoint_info: EndpointInfo) -> str:
+        workspace = endpoint_info.workspace
+        endpoint = endpoint_info.endpoint
+        return f"{workspace}:{endpoint}"
+
+    def _get_or_create_state(self, routing_key: str) -> PDRouterState:
+        state = self._states.get(routing_key)
+        if state is not None:
+            return state
+
+        with self._states_creation_lock:
+            state = self._states.get(routing_key)
+            if state is None:
+                state = PDRouterState()
+                self._states[routing_key] = state
+                logger.debug("Created new P/D router state for %s", routing_key)
+            return state
+
+    def _hash(self, key: str) -> int:
+        hash_obj = hashlib.md5(key.encode())
+        return int(hash_obj.hexdigest()[:16], 16)
+
+    def _search(self, state: PDRouterState, key_hash: int) -> Tuple[int, int]:
+        if not state.sorted_hashes:
+            raise ValueError("P/D decode hash ring is empty")
+
+        idx = bisect.bisect_left(state.sorted_hashes, key_hash)
+        if idx >= len(state.sorted_hashes):
+            idx = 0
+
+        return state.sorted_hashes[idx], idx
+
+    def _endpoint_role_group_id(self, endpoint: EndpointInfo) -> str:
+        return (
+            endpoint.role_group_id or endpoint.pod_name or endpoint.Id or endpoint.url
+        )
+
+    def _endpoint_role_count(self, endpoint: EndpointInfo, field_name: str) -> int:
+        value = getattr(endpoint, field_name, 1)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid P/D %s value %s for %s, using 1",
+                field_name,
+                value,
+                endpoint.url,
+            )
+            return 1
+        return max(parsed, 0)
+
+    def _add_decode_unit_to_ring(self, state: PDRouterState, unit: RouteUnit) -> None:
+        state.decode_units[unit.unit_id] = unit
+        state.decode_unit_counts_by_url[unit.url] = (
+            state.decode_unit_counts_by_url.get(unit.url, 0) + 1
+        )
+
+        for i in range(self._virtual_nodes):
+            virtual_node_key = f"{unit.unit_id}:{i}"
+            hash_val = self._hash(virtual_node_key)
+            state.hash_to_decode_unit_id[hash_val] = unit.unit_id
+            bisect.insort(state.sorted_hashes, hash_val)
+
+    def _sync_route_units(
+        self, routing_key: str, state: PDRouterState, endpoints: List[EndpointInfo]
+    ) -> None:
+        state.hash_to_decode_unit_id.clear()
+        state.sorted_hashes.clear()
+        state.decode_units.clear()
+        state.prefill_units_by_group.clear()
+        state.decode_unit_counts_by_url.clear()
+
+        for endpoint in sorted(endpoints, key=lambda e: e.url):
+            role_group_id = self._endpoint_role_group_id(endpoint)
+            prefill_count = self._endpoint_role_count(endpoint, "prefill_count")
+            decode_count = self._endpoint_role_count(endpoint, "decode_count")
+
+            for index in range(prefill_count):
+                unit = RouteUnit(
+                    role_group_id=role_group_id,
+                    role="prefill",
+                    index=index,
+                    url=endpoint.url,
+                    endpoint_info=endpoint,
+                )
+                state.prefill_units_by_group.setdefault(role_group_id, []).append(unit)
+
+            for index in range(decode_count):
+                self._add_decode_unit_to_ring(
+                    state,
+                    RouteUnit(
+                        role_group_id=role_group_id,
+                        role="decode",
+                        index=index,
+                        url=endpoint.url,
+                        endpoint_info=endpoint,
+                    ),
+                )
+
+        for units in state.prefill_units_by_group.values():
+            units.sort(key=lambda unit: unit.index)
+
+        state.last_sync_time = time.time()
+        logger.debug(
+            "PDRouter: Synced %s decode units and %s RoleGroups for %s",
+            len(state.decode_units),
+            len(state.prefill_units_by_group),
+            routing_key,
+        )
+
+    def _extract_cache_key(self, request_json: Dict, request_id: str) -> str:
+        if not request_json:
+            return request_id
+
+        try:
+            cache_components = []
+
+            if "messages" in request_json:
+                messages = request_json.get("messages", [])
+                system_prompt = None
+                user_messages = []
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if role == "system":
+                        system_prompt = content
+                    elif role == "user":
+                        user_messages.append(content)
+                        if len(user_messages) >= self._max_user_messages_for_cache:
+                            break
+
+                if system_prompt:
+                    cache_components.append(
+                        f"system:{json.dumps(system_prompt, sort_keys=True)}"
+                    )
+                for i, user_message in enumerate(user_messages):
+                    cache_components.append(
+                        f"user_{i}:{json.dumps(user_message, sort_keys=True)}"
+                    )
+
+            elif "prompt" in request_json:
+                cache_components.append(
+                    f"prompt:{json.dumps(request_json.get('prompt', ''), sort_keys=True)}"
+                )
+
+            return "|".join(cache_components) if cache_components else request_id
+        except Exception as e:
+            logger.warning("PDRouter: Error extracting cache key: %s", e)
+            return request_id
+
+    def _get_unit_load(self, state: PDRouterState, unit: RouteUnit) -> Optional[float]:
+        try:
+            from vllm_router.stats.request_stats import get_request_stats_monitor
+
+            monitor = get_request_stats_monitor()
+            active = monitor.get_active_request_count(unit.url)
+        except Exception as e:
+            logger.warning("PDRouter: Could not get load for %s: %s", unit.url, e)
+            return None
+
+        decode_units_on_url = max(state.decode_unit_counts_by_url.get(unit.url, 1), 1)
+        return active / decode_units_on_url
+
+    def _get_total_decode_load(self, state: PDRouterState) -> float:
+        total = 0.0
+        for unit in state.decode_units.values():
+            load = self._get_unit_load(state, unit)
+            if load is not None:
+                total += load
+        return total
+
+    def _check_load(self, state: PDRouterState, unit: RouteUnit) -> bool:
+        load = self._get_unit_load(state, unit)
+        if load is None:
+            return True
+
+        num_units = len(state.decode_units)
+        if num_units == 0:
+            return True
+
+        avg_load = (self._get_total_decode_load(state) + 1) / num_units
+        threshold = avg_load * self._load_factor
+        return (load + 1) <= threshold
+
+    def _select_decode_unit(
+        self, state: PDRouterState, payload_hash: int
+    ) -> Optional[RouteUnit]:
+        if not state.decode_units or not state.sorted_hashes:
+            return None
+
+        _, initial_idx = self._search(state, payload_hash)
+        checked_unit_ids: Set[str] = set()
+        default_unit = None
+        current_idx = initial_idx
+
+        while len(checked_unit_ids) < len(state.decode_units):
+            current_hash = state.sorted_hashes[current_idx]
+            current_unit_id = state.hash_to_decode_unit_id[current_hash]
+            current_unit = state.decode_units[current_unit_id]
+
+            if current_unit_id in checked_unit_ids:
+                current_idx = (current_idx + 1) % len(state.sorted_hashes)
+                continue
+
+            checked_unit_ids.add(current_unit_id)
+            if default_unit is None:
+                default_unit = current_unit
+
+            if self._check_load(state, current_unit):
+                return current_unit
+
+            current_idx = (current_idx + 1) % len(state.sorted_hashes)
+
+        return default_unit
+
+    def _select_prefill_unit(
+        self, state: PDRouterState, decode_unit: RouteUnit, payload_hash: int
+    ) -> Optional[RouteUnit]:
+        prefill_units = state.prefill_units_by_group.get(decode_unit.role_group_id, [])
+        if not prefill_units:
+            return None
+        return prefill_units[payload_hash % len(prefill_units)]
+
+    async def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+        request_json: Optional[Dict] = None,
+    ) -> Optional[PDRouteDecision]:
+        if not endpoints:
+            logger.error("PDRouter: No endpoints available for routing")
+            return None
+
+        routing_key = self._get_routing_key(endpoints[0])
+        state = self._get_or_create_state(routing_key)
+
+        with state.lock:
+            self._sync_route_units(routing_key, state, endpoints)
+
+            if request_json is None:
+                try:
+                    request_json = await request.json()
+                except Exception as e:
+                    logger.warning("PDRouter: Could not parse request JSON: %s", e)
+                    request_json = {}
+
+            request_id = str(uuid.uuid4())
+            cache_key = self._extract_cache_key(request_json, request_id)
+            payload_hash = self._hash(cache_key)
+
+            decode_unit = self._select_decode_unit(state, payload_hash)
+            if decode_unit is None:
+                logger.error("PDRouter: No ready decode unit for %s", routing_key)
+                return None
+
+            prefill_unit = self._select_prefill_unit(state, decode_unit, payload_hash)
+            if prefill_unit is None:
+                logger.error(
+                    "PDRouter: No ready prefill unit in RoleGroup %s for %s",
+                    decode_unit.role_group_id,
+                    routing_key,
+                )
+                return None
+
+            logger.info(
+                "PDRouter: Selected role_group=%s prefill=%s decode=%s url=%s",
+                decode_unit.role_group_id,
+                prefill_unit.index,
+                decode_unit.index,
+                decode_unit.url,
+            )
+            return PDRouteDecision(prefill=prefill_unit, decode=decode_unit)
 
 
 @dataclass
@@ -1430,6 +1794,13 @@ def initialize_routing_logic(
         return DisaggregatedPrefillRouter(
             kwargs.get("prefill_model_labels"), kwargs.get("decode_model_labels")
         )
+    elif routing_logic == RoutingLogic.PD:
+        logger.info("Initializing P/D same-host routing logic")
+        return PDRouter(
+            virtual_nodes_per_replica=kwargs.get("virtual_nodes_per_replica", 100),
+            load_factor=kwargs.get("load_factor", 1.25),
+            max_user_messages_for_cache=kwargs.get("max_user_messages_for_cache", 2),
+        )
     elif routing_logic == RoutingLogic.CONSISTENT_HASH:
         logger.info("Initializing consistent hash routing logic")
         return ConsistentHashRouter(
@@ -1460,6 +1831,7 @@ def get_routing_logic() -> RoutingInterface:
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
+        PDRouter,
         ConsistentHashRouter,
         StaticHashRouter,
     ):
@@ -1480,6 +1852,7 @@ def get_routing_logic_by_type(routing_logic: RoutingLogic) -> RoutingInterface:
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
+        PDRouter,
         ConsistentHashRouter,
         StaticHashRouter,
     ):
@@ -1499,6 +1872,7 @@ def cleanup_routing_logic():
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
+        PDRouter,
         ConsistentHashRouter,
         StaticHashRouter,
     ):

@@ -32,6 +32,7 @@ from vllm_router.log import init_logger
 logger = init_logger(__name__)
 
 _global_service_discovery: "Optional[ServiceDiscovery]" = None
+PD_ROUTING_LOGIC = "pd"
 
 
 class ServiceDiscoveryType(enum.Enum):
@@ -130,8 +131,13 @@ class EndpointInfo:
     # Routing logic
     routing_logic: Optional[str] = None
 
+    # P/D same-host role group metadata
+    role_group_id: Optional[str] = None
+    prefill_count: int = 1
+    decode_count: int = 1
+
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, role_group_id={self.role_group_id}, prefill_count={self.prefill_count}, decode_count={self.decode_count})"
 
     def get_base_models(self) -> List[str]:
         """
@@ -610,7 +616,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         except client.rest.ApiException as e:
             logger.error(f"Error removing sleeping label: {e}")
 
-    def _get_model_names(self, pod_ip) -> List[str]:
+    def _get_model_names(self, pod_ip, port: Optional[int] = None) -> List[str]:
         """
         Get the model names of the serving engine pod by querying the pod's
         '/v1/models' endpoint.
@@ -621,7 +627,8 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         Returns:
             List of model names available on the serving engine, including both base models and adapters
         """
-        url = f"http://{pod_ip}:{self.port}/v1/models"
+        target_port = port or self.port
+        url = f"http://{pod_ip}:{target_port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -645,7 +652,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             logger.error(f"Failed to get model names from {url}: {e}")
             return []
 
-    def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
+    def _get_model_info(
+        self, pod_ip, port: Optional[int] = None
+    ) -> Dict[str, ModelInfo]:
         """
         Get detailed model information from the serving engine pod.
 
@@ -655,7 +664,8 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         Returns:
             Dictionary mapping model IDs to their ModelInfo objects, including parent-child relationships
         """
-        url = f"http://{pod_ip}:{self.port}/v1/models"
+        target_port = port or self.port
+        url = f"http://{pod_ip}:{target_port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -733,6 +743,166 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return pod.metadata.labels.get("routing_logic")
 
+    @staticmethod
+    def _get_metadata_value(pod, keys: List[str]) -> Optional[str]:
+        labels = pod.metadata.labels or {}
+        annotations = pod.metadata.annotations or {}
+        for key in keys:
+            if key in labels:
+                return labels[key]
+            if key in annotations:
+                return annotations[key]
+        return None
+
+    @staticmethod
+    def _parse_nonnegative_int(value: Optional[str], default: int) -> int:
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid P/D metadata integer %s, using %s", value, default)
+            return default
+        if parsed < 0:
+            logger.warning("Negative P/D metadata integer %s, using %s", value, default)
+            return default
+        return parsed
+
+    @staticmethod
+    def _parse_positive_int(value: Optional[str], field_name: str) -> Optional[int]:
+        if value is None:
+            logger.warning("Missing required P/D metadata field %s", field_name)
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid P/D metadata field %s=%s", field_name, value)
+            return None
+        if parsed <= 0:
+            logger.warning(
+                "P/D metadata field %s must be positive: %s", field_name, value
+            )
+            return None
+        return parsed
+
+    def _get_role_group_id(self, pod) -> str:
+        """
+        Get the stable P/D RoleGroup id from pod metadata.
+
+        Defaults to the pod name because one collocated Pod represents one
+        RoleGroup in the K8s same-host design.
+        """
+        return (
+            self._get_metadata_value(
+                pod,
+                [
+                    "neutree.ai/role-group-id",
+                    "role_group_id",
+                    "role-group-id",
+                ],
+            )
+            or pod.metadata.name
+        )
+
+    def _get_pd_role_counts(self, pod) -> tuple[Optional[int], Optional[int]]:
+        """
+        Get logical prefill/decode unit counts for a collocated P/D Pod.
+        """
+        prefill_count = self._parse_positive_int(
+            self._get_metadata_value(
+                pod,
+                [
+                    "neutree.ai/prefill-replicas",
+                    "neutree.ai/prefill-count",
+                    "prefill_replicas",
+                    "prefill_count",
+                ],
+            ),
+            "prefill_count",
+        )
+        decode_count = self._parse_positive_int(
+            self._get_metadata_value(
+                pod,
+                [
+                    "neutree.ai/decode-replicas",
+                    "neutree.ai/decode-count",
+                    "decode_replicas",
+                    "decode_count",
+                ],
+            ),
+            "decode_count",
+        )
+        return prefill_count, decode_count
+
+    def _get_pd_sidecar_port(self, pod) -> Optional[int]:
+        """
+        Get the sidecar port override for a collocated P/D Pod.
+        """
+        value = self._get_metadata_value(
+            pod,
+            [
+                "neutree.ai/pd-sidecar-port",
+                "pd_sidecar_port",
+                "pd-sidecar-port",
+            ],
+        )
+        if value is None:
+            logger.warning("Missing required P/D metadata field pd_sidecar_port")
+            return None
+        return self._parse_positive_int(value, "pd_sidecar_port")
+
+    def _get_pd_metadata(
+        self, pod, routing_logic: Optional[str]
+    ) -> tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+        if routing_logic != PD_ROUTING_LOGIC:
+            return None, None, None, None
+
+        role_group_id = self._get_role_group_id(pod)
+        prefill_count, decode_count = self._get_pd_role_counts(pod)
+        pd_sidecar_port = self._get_pd_sidecar_port(pod)
+        if prefill_count is None or decode_count is None or pd_sidecar_port is None:
+            logger.warning(
+                "P/D pod %s is missing valid routing metadata; marking unavailable",
+                pod.metadata.name,
+            )
+            return role_group_id, None, None, None
+
+        return role_group_id, prefill_count, decode_count, pd_sidecar_port
+
+    def _engine_needs_refresh(
+        self,
+        engine_name: str,
+        engine_ip: str,
+        model_names: List[str],
+        model_label: Optional[str],
+        workspace: Optional[str],
+        endpoint: Optional[str],
+        routing_logic: Optional[str],
+        role_group_id: Optional[str],
+        prefill_count: Optional[int],
+        decode_count: Optional[int],
+        pd_sidecar_port: Optional[int],
+    ) -> bool:
+        with self.available_engines_lock:
+            existing = self.available_engines.get(engine_name)
+
+        if existing is None:
+            return True
+
+        target_port = pd_sidecar_port or self.port
+        target_url = f"http://{engine_ip}:{target_port}"
+        return (
+            existing.url != target_url
+            or existing.model_names != model_names
+            or existing.model_label != model_label
+            or existing.workspace != workspace
+            or existing.endpoint != endpoint
+            or existing.routing_logic != routing_logic
+            or existing.role_group_id != role_group_id
+            or existing.prefill_count != (prefill_count or 1)
+            or existing.decode_count != (decode_count or 1)
+        )
+
     def _watch_engines(self):
         while self.running:
             try:
@@ -761,12 +931,32 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     # Pod is ready if container is ready and pod is not terminating
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
+                    role_group_id = None
+                    prefill_count = None
+                    decode_count = None
+                    pd_sidecar_port = None
+
                     if is_pod_ready:
-                        model_names = self._get_model_names(pod_ip)
+                        routing_logic = self._get_routing_logic(pod)
+                        (
+                            role_group_id,
+                            prefill_count,
+                            decode_count,
+                            pd_sidecar_port,
+                        ) = self._get_pd_metadata(pod, routing_logic)
+                        if routing_logic == PD_ROUTING_LOGIC and (
+                            prefill_count is None
+                            or decode_count is None
+                            or pd_sidecar_port is None
+                        ):
+                            is_pod_ready = False
+                            model_names = []
+                        else:
+                            model_names = self._get_model_names(pod_ip, pd_sidecar_port)
+                    if is_pod_ready:
                         model_label = self._get_model_label(pod)
                         workspace = self._get_workspace(pod)
                         endpoint = self._get_endpoint(pod)
-                        routing_logic = self._get_routing_logic(pod)
                     else:
                         model_names = []
                         model_label = None
@@ -790,6 +980,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
+                        role_group_id,
+                        prefill_count,
+                        decode_count,
+                        pd_sidecar_port,
                     )
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
@@ -804,6 +998,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: str,
         endpoint: str,
         routing_logic: str,
+        role_group_id: Optional[str],
+        prefill_count: Optional[int],
+        decode_count: Optional[int],
+        pd_sidecar_port: Optional[int],
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -811,7 +1009,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         )
 
         # Get detailed model information
-        model_info = self._get_model_info(engine_ip)
+        model_info = self._get_model_info(engine_ip, pd_sidecar_port)
 
         # Check if engine is enabled with sleep mode and set engine sleep status
         if self._check_engine_sleep_mode(engine_name):
@@ -820,8 +1018,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             sleep_status = False
 
         with self.available_engines_lock:
+            target_port = pd_sidecar_port or self.port
             self.available_engines[engine_name] = EndpointInfo(
-                url=f"http://{engine_ip}:{self.port}",
+                url=f"http://{engine_ip}:{target_port}",
                 model_names=model_names,
                 added_timestamp=int(time.time()),
                 Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, engine_name)),
@@ -833,6 +1032,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace=workspace,
                 endpoint=endpoint,
                 routing_logic=routing_logic,
+                role_group_id=role_group_id,
+                prefill_count=prefill_count or 1,
+                decode_count=decode_count or 1,
             )
 
             # Store model information in the endpoint info
@@ -886,6 +1088,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
+        role_group_id: Optional[str],
+        prefill_count: Optional[int],
+        decode_count: Optional[int],
+        pd_sidecar_port: Optional[int],
     ) -> None:
         """
         Handle engine update events from Kubernetes watcher.
@@ -910,6 +1116,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace,
                 endpoint,
                 routing_logic,
+                role_group_id,
+                prefill_count,
+                decode_count,
+                pd_sidecar_port,
             )
 
         elif event == "DELETED":
@@ -936,7 +1146,39 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     workspace,
                     endpoint,
                     routing_logic,
+                    role_group_id,
+                    prefill_count,
+                    decode_count,
+                    pd_sidecar_port,
                 )
+            elif is_now_available and was_available:
+                if self._engine_needs_refresh(
+                    engine_name,
+                    engine_ip,
+                    model_names,
+                    model_label,
+                    workspace,
+                    endpoint,
+                    routing_logic,
+                    role_group_id,
+                    prefill_count,
+                    decode_count,
+                    pd_sidecar_port,
+                ):
+                    self._delete_engine(engine_name)
+                    self._add_engine(
+                        engine_name,
+                        engine_ip,
+                        model_names,
+                        model_label,
+                        workspace,
+                        endpoint,
+                        routing_logic,
+                        role_group_id,
+                        prefill_count,
+                        decode_count,
+                        pd_sidecar_port,
+                    )
             elif not is_now_available and was_available:
                 # Engine became unavailable: trigger ENGINE_DELETED
                 self._delete_engine(engine_name)
