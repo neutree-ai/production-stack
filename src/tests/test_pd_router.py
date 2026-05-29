@@ -83,6 +83,36 @@ async def test_pd_router_fails_closed_when_decode_group_has_no_prefill_unit():
     assert decision is None
 
 
+@pytest.mark.asyncio
+async def test_pd_router_prefill_uses_chwbl_within_selected_role_group(monkeypatch):
+    cleanup_routing_logic()
+    router = PDRouter(virtual_nodes_per_replica=8, load_factor=1.0)
+    endpoints = [
+        make_endpoint("http://10.0.0.1:9000", "rg-0", prefill_count=2, decode_count=1),
+    ]
+
+    def fake_get_unit_load(state, unit):
+        if unit.role == "prefill" and unit.index == 0:
+            return 100
+        return 0
+
+    monkeypatch.setattr(router, "_get_unit_load", fake_get_unit_load)
+
+    decision = await router.route_request(
+        endpoints,
+        engine_stats={},
+        request_stats={},
+        request=Request(),
+        request_json={"model": "llama", "prompt": "prefill-load-test-0"},
+    )
+
+    assert decision is not None
+    assert decision.prefill.index == 1
+    assert decision.prefill.role_group_id == decision.decode.role_group_id
+
+    cleanup_routing_logic()
+
+
 def test_pd_routing_logic_is_registered_for_dynamic_endpoint_labels():
     cleanup_routing_logic()
 

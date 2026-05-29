@@ -594,9 +594,16 @@ class PDRouterState:
 
     hash_to_decode_unit_id: Dict[int, str] = field(default_factory=dict)
     sorted_hashes: List[int] = field(default_factory=list)
+    hash_to_prefill_unit_id_by_group: Dict[str, Dict[int, str]] = field(
+        default_factory=dict
+    )
+    prefill_sorted_hashes_by_group: Dict[str, List[int]] = field(default_factory=dict)
     decode_units: Dict[str, RouteUnit] = field(default_factory=dict)
-    prefill_units_by_group: Dict[str, List[RouteUnit]] = field(default_factory=dict)
+    prefill_units_by_group: Dict[str, Dict[str, RouteUnit]] = field(
+        default_factory=dict
+    )
     decode_unit_counts_by_url: Dict[str, int] = field(default_factory=dict)
+    prefill_unit_counts_by_url: Dict[str, int] = field(default_factory=dict)
     last_sync_time: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -628,7 +635,7 @@ class PDRouter(RoutingInterface):
         self._initialized = True
 
         logger.info(
-            "Initialized PDRouter with %s virtual nodes per decode unit, "
+            "Initialized PDRouter with %s virtual nodes per P/D unit, "
             "load factor %s, max_user_messages_for_cache=%s",
             virtual_nodes_per_replica,
             load_factor,
@@ -657,15 +664,15 @@ class PDRouter(RoutingInterface):
         hash_obj = hashlib.md5(key.encode())
         return int(hash_obj.hexdigest()[:16], 16)
 
-    def _search(self, state: PDRouterState, key_hash: int) -> Tuple[int, int]:
-        if not state.sorted_hashes:
-            raise ValueError("P/D decode hash ring is empty")
+    def _search(self, sorted_hashes: List[int], key_hash: int) -> Tuple[int, int]:
+        if not sorted_hashes:
+            raise ValueError("P/D hash ring is empty")
 
-        idx = bisect.bisect_left(state.sorted_hashes, key_hash)
-        if idx >= len(state.sorted_hashes):
+        idx = bisect.bisect_left(sorted_hashes, key_hash)
+        if idx >= len(sorted_hashes):
             idx = 0
 
-        return state.sorted_hashes[idx], idx
+        return sorted_hashes[idx], idx
 
     def _endpoint_role_group_id(self, endpoint: EndpointInfo) -> str:
         return (
@@ -698,14 +705,37 @@ class PDRouter(RoutingInterface):
             state.hash_to_decode_unit_id[hash_val] = unit.unit_id
             bisect.insort(state.sorted_hashes, hash_val)
 
+    def _add_prefill_unit_to_ring(self, state: PDRouterState, unit: RouteUnit) -> None:
+        state.prefill_units_by_group.setdefault(unit.role_group_id, {})[
+            unit.unit_id
+        ] = unit
+        state.prefill_unit_counts_by_url[unit.url] = (
+            state.prefill_unit_counts_by_url.get(unit.url, 0) + 1
+        )
+
+        hash_to_unit_id = state.hash_to_prefill_unit_id_by_group.setdefault(
+            unit.role_group_id, {}
+        )
+        sorted_hashes = state.prefill_sorted_hashes_by_group.setdefault(
+            unit.role_group_id, []
+        )
+        for i in range(self._virtual_nodes):
+            virtual_node_key = f"{unit.unit_id}:{i}"
+            hash_val = self._hash(virtual_node_key)
+            hash_to_unit_id[hash_val] = unit.unit_id
+            bisect.insort(sorted_hashes, hash_val)
+
     def _sync_route_units(
         self, routing_key: str, state: PDRouterState, endpoints: List[EndpointInfo]
     ) -> None:
         state.hash_to_decode_unit_id.clear()
         state.sorted_hashes.clear()
+        state.hash_to_prefill_unit_id_by_group.clear()
+        state.prefill_sorted_hashes_by_group.clear()
         state.decode_units.clear()
         state.prefill_units_by_group.clear()
         state.decode_unit_counts_by_url.clear()
+        state.prefill_unit_counts_by_url.clear()
 
         for endpoint in sorted(endpoints, key=lambda e: e.url):
             role_group_id = self._endpoint_role_group_id(endpoint)
@@ -713,14 +743,16 @@ class PDRouter(RoutingInterface):
             decode_count = self._endpoint_role_count(endpoint, "decode_count")
 
             for index in range(prefill_count):
-                unit = RouteUnit(
-                    role_group_id=role_group_id,
-                    role="prefill",
-                    index=index,
-                    url=endpoint.url,
-                    endpoint_info=endpoint,
+                self._add_prefill_unit_to_ring(
+                    state,
+                    RouteUnit(
+                        role_group_id=role_group_id,
+                        role="prefill",
+                        index=index,
+                        url=endpoint.url,
+                        endpoint_info=endpoint,
+                    ),
                 )
-                state.prefill_units_by_group.setdefault(role_group_id, []).append(unit)
 
             for index in range(decode_count):
                 self._add_decode_unit_to_ring(
@@ -733,9 +765,6 @@ class PDRouter(RoutingInterface):
                         endpoint_info=endpoint,
                     ),
                 )
-
-        for units in state.prefill_units_by_group.values():
-            units.sort(key=lambda unit: unit.index)
 
         state.last_sync_time = time.time()
         logger.debug(
@@ -797,68 +826,96 @@ class PDRouter(RoutingInterface):
             logger.warning("PDRouter: Could not get load for %s: %s", unit.url, e)
             return None
 
-        decode_units_on_url = max(state.decode_unit_counts_by_url.get(unit.url, 1), 1)
-        return active / decode_units_on_url
+        if unit.role == "prefill":
+            units_on_url = state.prefill_unit_counts_by_url.get(unit.url, 1)
+        else:
+            units_on_url = state.decode_unit_counts_by_url.get(unit.url, 1)
+        return active / max(units_on_url, 1)
 
-    def _get_total_decode_load(self, state: PDRouterState) -> float:
+    def _get_total_unit_load(
+        self, state: PDRouterState, units: List[RouteUnit]
+    ) -> float:
         total = 0.0
-        for unit in state.decode_units.values():
+        for unit in units:
             load = self._get_unit_load(state, unit)
             if load is not None:
                 total += load
         return total
 
-    def _check_load(self, state: PDRouterState, unit: RouteUnit) -> bool:
+    def _check_load(
+        self, state: PDRouterState, unit: RouteUnit, candidate_units: List[RouteUnit]
+    ) -> bool:
         load = self._get_unit_load(state, unit)
         if load is None:
             return True
 
-        num_units = len(state.decode_units)
+        num_units = len(candidate_units)
         if num_units == 0:
             return True
 
-        avg_load = (self._get_total_decode_load(state) + 1) / num_units
+        avg_load = (self._get_total_unit_load(state, candidate_units) + 1) / num_units
         threshold = avg_load * self._load_factor
         return (load + 1) <= threshold
 
-    def _select_decode_unit(
-        self, state: PDRouterState, payload_hash: int
+    def _select_unit_from_ring(
+        self,
+        state: PDRouterState,
+        payload_hash: int,
+        units_by_id: Dict[str, RouteUnit],
+        hash_to_unit_id: Dict[int, str],
+        sorted_hashes: List[int],
     ) -> Optional[RouteUnit]:
-        if not state.decode_units or not state.sorted_hashes:
+        if not units_by_id or not sorted_hashes:
             return None
 
-        _, initial_idx = self._search(state, payload_hash)
+        candidate_units = list(units_by_id.values())
+        _, initial_idx = self._search(sorted_hashes, payload_hash)
         checked_unit_ids: Set[str] = set()
         default_unit = None
         current_idx = initial_idx
 
-        while len(checked_unit_ids) < len(state.decode_units):
-            current_hash = state.sorted_hashes[current_idx]
-            current_unit_id = state.hash_to_decode_unit_id[current_hash]
-            current_unit = state.decode_units[current_unit_id]
+        while len(checked_unit_ids) < len(units_by_id):
+            current_hash = sorted_hashes[current_idx]
+            current_unit_id = hash_to_unit_id[current_hash]
+            current_unit = units_by_id[current_unit_id]
 
             if current_unit_id in checked_unit_ids:
-                current_idx = (current_idx + 1) % len(state.sorted_hashes)
+                current_idx = (current_idx + 1) % len(sorted_hashes)
                 continue
 
             checked_unit_ids.add(current_unit_id)
             if default_unit is None:
                 default_unit = current_unit
 
-            if self._check_load(state, current_unit):
+            if self._check_load(state, current_unit, candidate_units):
                 return current_unit
 
-            current_idx = (current_idx + 1) % len(state.sorted_hashes)
+            current_idx = (current_idx + 1) % len(sorted_hashes)
 
         return default_unit
+
+    def _select_decode_unit(
+        self, state: PDRouterState, payload_hash: int
+    ) -> Optional[RouteUnit]:
+        return self._select_unit_from_ring(
+            state,
+            payload_hash,
+            state.decode_units,
+            state.hash_to_decode_unit_id,
+            state.sorted_hashes,
+        )
 
     def _select_prefill_unit(
         self, state: PDRouterState, decode_unit: RouteUnit, payload_hash: int
     ) -> Optional[RouteUnit]:
-        prefill_units = state.prefill_units_by_group.get(decode_unit.role_group_id, [])
-        if not prefill_units:
-            return None
-        return prefill_units[payload_hash % len(prefill_units)]
+        prefill_units = state.prefill_units_by_group.get(decode_unit.role_group_id, {})
+        return self._select_unit_from_ring(
+            state,
+            payload_hash,
+            prefill_units,
+            state.hash_to_prefill_unit_id_by_group.get(decode_unit.role_group_id, {}),
+            state.prefill_sorted_hashes_by_group.get(decode_unit.role_group_id, []),
+        )
 
     async def route_request(
         self,
