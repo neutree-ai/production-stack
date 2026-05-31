@@ -19,7 +19,7 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
 import aiohttp
@@ -190,23 +190,14 @@ class EndpointInfo:
     # Routing logic
     routing_logic: Optional[str] = None
 
-    # P/D group and rank metadata. Discovery expands group targets into one
-    # EndpointInfo per schedulable P/D unit before the router sees them.
-    group_id: Optional[str] = None
-    group_uid: Optional[str] = None
+    # P/D rank metadata. Discovery expands group targets into one EndpointInfo
+    # per schedulable P/D unit before the router sees them.
     domain: Optional[str] = None
-    pd_role: Optional[str] = None
-    pd_rank: Optional[int] = None
-    route_meta: Dict[str, int] = field(default_factory=dict)
-
-    # Deprecated count-based metadata kept for compatibility with older callers.
-    # PDRouter no longer expands these counts on the request path.
-    role_group_id: Optional[str] = None
-    prefill_count: int = 1
-    decode_count: int = 1
+    role: Optional[str] = None
+    rank: Optional[int] = None
 
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, group_id={self.group_id}, group_uid={self.group_uid}, domain={self.domain}, pd_role={self.pd_role}, pd_rank={self.pd_rank}, route_meta={self.route_meta})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, domain={self.domain}, role={self.role}, rank={self.rank})"
 
     def get_base_models(self) -> List[str]:
         """
@@ -688,7 +679,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         except client.rest.ApiException as e:
             logger.error(f"Error removing sleeping label: {e}")
 
-    def _get_model_names(self, pod_ip, port: Optional[int] = None) -> List[str]:
+    def _get_model_names(self, pod_ip) -> List[str]:
         """
         Get the model names of the serving engine pod by querying the pod's
         '/v1/models' endpoint.
@@ -699,8 +690,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         Returns:
             List of model names available on the serving engine, including both base models and adapters
         """
-        target_port = port or self.port
-        url = f"http://{pod_ip}:{target_port}/v1/models"
+        url = f"http://{pod_ip}:{self.port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -724,9 +714,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             logger.error(f"Failed to get model names from {url}: {e}")
             return []
 
-    def _get_model_info(
-        self, pod_ip, port: Optional[int] = None
-    ) -> Dict[str, ModelInfo]:
+    def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
         """
         Get detailed model information from the serving engine pod.
 
@@ -736,8 +724,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         Returns:
             Dictionary mapping model IDs to their ModelInfo objects, including parent-child relationships
         """
-        target_port = port or self.port
-        url = f"http://{pod_ip}:{target_port}/v1/models"
+        url = f"http://{pod_ip}:{self.port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -857,15 +844,8 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return parsed
 
-    def _get_role_group_id(self, pod) -> str:
-        """Get the stable P/D group id from Kubernetes object identity."""
-        return pod.metadata.name
-
-    def _get_pd_group_uid(self, pod) -> Optional[str]:
-        return getattr(pod.metadata, "uid", None)
-
     def _get_pd_domain(self, pod) -> str:
-        return pod.metadata.name or self._get_pd_group_uid(pod)
+        return pod.metadata.name or getattr(pod.metadata, "uid", None)
 
     def _get_pd_deployment_type(self, pod) -> Optional[str]:
         return self._get_metadata_value(
@@ -898,12 +878,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
     def _get_pd_metadata(
         self, pod, routing_logic: Optional[str]
-    ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
+    ) -> tuple[Optional[str], Optional[int]]:
         if routing_logic != PD_ROUTING_LOGIC:
-            return None, None, None, None
+            return None, None
 
-        role_group_id = self._get_role_group_id(pod)
-        group_uid = self._get_pd_group_uid(pod)
         domain = self._get_pd_domain(pod)
         pd_sidecar_port = self._get_pd_sidecar_port(pod)
         if self._get_pd_deployment_type(pod) != "group" or pd_sidecar_port is None:
@@ -911,9 +889,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 "P/D pod %s is missing valid group routing metadata; marking unavailable",
                 pod.metadata.name,
             )
-            return role_group_id, group_uid, domain, None
+            return domain, None
 
-        return role_group_id, group_uid, domain, pd_sidecar_port
+        return domain, pd_sidecar_port
 
     def _get_pd_topology(
         self, pod_ip: str, pd_sidecar_port: Optional[int]
@@ -935,8 +913,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
-        role_group_id: Optional[str],
-        group_uid: Optional[str],
         domain: Optional[str],
         pd_sidecar_port: Optional[int],
         pd_topology: Optional[PDTopology],
@@ -952,8 +928,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace,
                 endpoint,
                 routing_logic,
-                role_group_id,
-                group_uid,
                 domain,
                 pd_topology,
             )
@@ -984,10 +958,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
     def _pd_unit_engine_name(engine_name: str, unit: PDTopologyUnit) -> str:
         return f"{engine_name}:{unit.role}:{unit.rank}"
 
-    @staticmethod
-    def _route_meta_for_pd_unit(unit: PDTopologyUnit) -> Dict[str, int]:
-        return {f"{unit.role}_index": unit.rank}
-
     def _build_pd_endpoint_info(
         self,
         engine_name: str,
@@ -997,8 +967,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: str,
         endpoint: str,
         routing_logic: str,
-        role_group_id: str,
-        group_uid: Optional[str],
         domain: Optional[str],
         pd_sidecar_port: int,
         model_info: Dict[str, ModelInfo],
@@ -1020,15 +988,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             workspace=workspace,
             endpoint=endpoint,
             routing_logic=routing_logic,
-            group_id=role_group_id,
-            group_uid=group_uid,
             domain=domain,
-            pd_role=unit.role,
-            pd_rank=unit.rank,
-            route_meta=self._route_meta_for_pd_unit(unit),
-            role_group_id=role_group_id,
-            prefill_count=0,
-            decode_count=0,
+            role=unit.role,
+            rank=unit.rank,
         )
         return unit_engine_name, endpoint_info
 
@@ -1041,12 +1003,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             endpoint_info.workspace,
             endpoint_info.endpoint,
             endpoint_info.routing_logic,
-            endpoint_info.group_id,
-            endpoint_info.group_uid,
             endpoint_info.domain,
-            endpoint_info.pd_role,
-            endpoint_info.pd_rank,
-            tuple(sorted(endpoint_info.route_meta.items())),
+            endpoint_info.role,
+            endpoint_info.rank,
         )
 
     def _build_pd_endpoint_signatures(
@@ -1057,8 +1016,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
-        role_group_id: Optional[str],
-        group_uid: Optional[str],
         domain: Optional[str],
         pd_topology: Optional[PDTopology],
     ) -> Set[tuple]:
@@ -1072,12 +1029,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace,
                 endpoint,
                 routing_logic,
-                role_group_id,
-                group_uid,
                 domain,
                 unit.role,
                 unit.rank,
-                tuple(sorted(self._route_meta_for_pd_unit(unit).items())),
             )
             for unit in pd_topology.units
         }
@@ -1113,20 +1067,15 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     # Pod is ready if container is ready and pod is not terminating
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
-                    role_group_id = None
-                    group_uid = None
                     domain = None
                     pd_sidecar_port = None
                     pd_topology = None
 
                     if is_pod_ready:
                         routing_logic = self._get_routing_logic(pod)
-                        (
-                            role_group_id,
-                            group_uid,
-                            domain,
-                            pd_sidecar_port,
-                        ) = self._get_pd_metadata(pod, routing_logic)
+                        domain, pd_sidecar_port = self._get_pd_metadata(
+                            pod, routing_logic
+                        )
                         if routing_logic == PD_ROUTING_LOGIC:
                             pd_topology = self._get_pd_topology(pod_ip, pd_sidecar_port)
                         if routing_logic == PD_ROUTING_LOGIC and (
@@ -1135,7 +1084,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                             is_pod_ready = False
                             model_names = []
                         else:
-                            model_names = self._get_model_names(pod_ip, pd_sidecar_port)
+                            model_names = self._get_model_names(pod_ip)
                     if is_pod_ready:
                         model_label = self._get_model_label(pod)
                         workspace = self._get_workspace(pod)
@@ -1164,8 +1113,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
-                        role_group_id,
-                        group_uid,
                         domain,
                         pd_sidecar_port,
                         pd_topology,
@@ -1183,8 +1130,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: str,
         endpoint: str,
         routing_logic: str,
-        role_group_id: Optional[str],
-        group_uid: Optional[str],
         domain: Optional[str],
         pd_sidecar_port: Optional[int],
         pd_topology: Optional[PDTopology],
@@ -1195,7 +1140,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         )
 
         # Get detailed model information
-        model_info = self._get_model_info(engine_ip, pd_sidecar_port)
+        model_info = self._get_model_info(engine_ip)
 
         # Check if engine is enabled with sleep mode and set engine sleep status
         if self._check_engine_sleep_mode(engine_name):
@@ -1216,8 +1161,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
-                        role_group_id or pd_topology.group_id,
-                        group_uid,
                         domain,
                         target_port,
                         model_info,
@@ -1294,8 +1237,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
-        role_group_id: Optional[str],
-        group_uid: Optional[str],
         domain: Optional[str],
         pd_sidecar_port: Optional[int],
         pd_topology: Optional[PDTopology],
@@ -1323,8 +1264,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace,
                 endpoint,
                 routing_logic,
-                role_group_id,
-                group_uid,
                 domain,
                 pd_sidecar_port,
                 pd_topology,
@@ -1360,8 +1299,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     workspace,
                     endpoint,
                     routing_logic,
-                    role_group_id,
-                    group_uid,
                     domain,
                     pd_sidecar_port,
                     pd_topology,
@@ -1375,8 +1312,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     workspace,
                     endpoint,
                     routing_logic,
-                    role_group_id,
-                    group_uid,
                     domain,
                     pd_sidecar_port,
                     pd_topology,
@@ -1390,8 +1325,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
-                        role_group_id,
-                        group_uid,
                         domain,
                         pd_sidecar_port,
                         pd_topology,

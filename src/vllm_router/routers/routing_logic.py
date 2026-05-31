@@ -555,9 +555,9 @@ class DisaggregatedPrefillRouter(RoutingInterface):
 
 @dataclass(frozen=True)
 class RouteUnit:
-    """Logical P/D route target inside a RoleGroup."""
+    """Logical P/D route target inside a P/D domain."""
 
-    role_group_id: str
+    domain: str
     role: str
     index: int
     url: str
@@ -565,7 +565,7 @@ class RouteUnit:
 
     @property
     def unit_id(self) -> str:
-        return f"{self.role_group_id}:{self.role}:{self.index}:{self.url}"
+        return f"{self.domain}:{self.role}:{self.index}:{self.url}"
 
 
 @dataclass(frozen=True)
@@ -582,7 +582,7 @@ class PDRouteDecision:
     @property
     def headers(self) -> Dict[str, str]:
         return {
-            "X-Neutree-PD-Role-Group": self.decode.role_group_id,
+            "X-Neutree-PD-Role-Group": self.decode.domain,
             "X-Neutree-PD-Prefill-Index": str(self.prefill.index),
             "X-Neutree-PD-Decode-Index": str(self.decode.index),
         }
@@ -594,12 +594,12 @@ class PDRouterState:
 
     hash_to_decode_unit_id: Dict[int, str] = field(default_factory=dict)
     sorted_hashes: List[int] = field(default_factory=list)
-    hash_to_prefill_unit_id_by_group: Dict[str, Dict[int, str]] = field(
+    hash_to_prefill_unit_id_by_domain: Dict[str, Dict[int, str]] = field(
         default_factory=dict
     )
-    prefill_sorted_hashes_by_group: Dict[str, List[int]] = field(default_factory=dict)
+    prefill_sorted_hashes_by_domain: Dict[str, List[int]] = field(default_factory=dict)
     decode_units: Dict[str, RouteUnit] = field(default_factory=dict)
-    prefill_units_by_group: Dict[str, Dict[str, RouteUnit]] = field(
+    prefill_units_by_domain: Dict[str, Dict[str, RouteUnit]] = field(
         default_factory=dict
     )
     decode_unit_counts_by_url: Dict[str, int] = field(default_factory=dict)
@@ -610,7 +610,7 @@ class PDRouterState:
 
 class PDRouter(RoutingInterface):
     """
-    Route collocated P/D requests by selecting decode first, then prefill in the same RoleGroup.
+    Route collocated P/D requests by selecting decode first, then prefill in the same domain.
 
     Discovery expands direct/group targets into one EndpointInfo per schedulable
     P/D unit. The router only consumes those unit endpoints and sends the
@@ -673,26 +673,15 @@ class PDRouter(RoutingInterface):
 
         return sorted_hashes[idx], idx
 
-    def _endpoint_role_group_id(self, endpoint: EndpointInfo) -> str:
-        return (
-            getattr(endpoint, "group_id", None)
-            or endpoint.role_group_id
-            or endpoint.pod_name
-            or endpoint.Id
-            or endpoint.url
-        )
+    def _endpoint_domain(self, endpoint: EndpointInfo) -> str:
+        return endpoint.domain or endpoint.pod_name or endpoint.Id or endpoint.url
 
-    def _endpoint_pd_role(self, endpoint: EndpointInfo) -> Optional[str]:
-        role = getattr(endpoint, "pd_role", None)
+    def _endpoint_role(self, endpoint: EndpointInfo) -> Optional[str]:
+        role = getattr(endpoint, "role", None)
         return role if role in {"prefill", "decode"} else None
 
-    def _endpoint_pd_rank(self, endpoint: EndpointInfo) -> Optional[int]:
-        rank = getattr(endpoint, "pd_rank", None)
-        if rank is None:
-            route_meta = getattr(endpoint, "route_meta", {}) or {}
-            role = self._endpoint_pd_role(endpoint)
-            if role is not None:
-                rank = route_meta.get(f"{role}_index")
+    def _endpoint_rank(self, endpoint: EndpointInfo) -> Optional[int]:
+        rank = getattr(endpoint, "rank", None)
         try:
             parsed = int(rank)
         except (TypeError, ValueError):
@@ -712,18 +701,16 @@ class PDRouter(RoutingInterface):
             bisect.insort(state.sorted_hashes, hash_val)
 
     def _add_prefill_unit_to_ring(self, state: PDRouterState, unit: RouteUnit) -> None:
-        state.prefill_units_by_group.setdefault(unit.role_group_id, {})[
-            unit.unit_id
-        ] = unit
+        state.prefill_units_by_domain.setdefault(unit.domain, {})[unit.unit_id] = unit
         state.prefill_unit_counts_by_url[unit.url] = (
             state.prefill_unit_counts_by_url.get(unit.url, 0) + 1
         )
 
-        hash_to_unit_id = state.hash_to_prefill_unit_id_by_group.setdefault(
-            unit.role_group_id, {}
+        hash_to_unit_id = state.hash_to_prefill_unit_id_by_domain.setdefault(
+            unit.domain, {}
         )
-        sorted_hashes = state.prefill_sorted_hashes_by_group.setdefault(
-            unit.role_group_id, []
+        sorted_hashes = state.prefill_sorted_hashes_by_domain.setdefault(
+            unit.domain, []
         )
         for i in range(self._virtual_nodes):
             virtual_node_key = f"{unit.unit_id}:{i}"
@@ -736,17 +723,17 @@ class PDRouter(RoutingInterface):
     ) -> None:
         state.hash_to_decode_unit_id.clear()
         state.sorted_hashes.clear()
-        state.hash_to_prefill_unit_id_by_group.clear()
-        state.prefill_sorted_hashes_by_group.clear()
+        state.hash_to_prefill_unit_id_by_domain.clear()
+        state.prefill_sorted_hashes_by_domain.clear()
         state.decode_units.clear()
-        state.prefill_units_by_group.clear()
+        state.prefill_units_by_domain.clear()
         state.decode_unit_counts_by_url.clear()
         state.prefill_unit_counts_by_url.clear()
 
         for endpoint in sorted(endpoints, key=lambda e: e.url):
-            role_group_id = self._endpoint_role_group_id(endpoint)
-            role = self._endpoint_pd_role(endpoint)
-            rank = self._endpoint_pd_rank(endpoint)
+            domain = self._endpoint_domain(endpoint)
+            role = self._endpoint_role(endpoint)
+            rank = self._endpoint_rank(endpoint)
             if role is None or rank is None:
                 logger.debug(
                     "PDRouter: Skipping non-expanded P/D endpoint %s role=%s rank=%s",
@@ -757,7 +744,7 @@ class PDRouter(RoutingInterface):
                 continue
 
             unit = RouteUnit(
-                role_group_id=role_group_id,
+                domain=domain,
                 role=role,
                 index=rank,
                 url=endpoint.url,
@@ -773,9 +760,9 @@ class PDRouter(RoutingInterface):
 
         state.last_sync_time = time.time()
         logger.debug(
-            "PDRouter: Synced %s decode units and %s RoleGroups for %s",
+            "PDRouter: Synced %s decode units and %s domains for %s",
             len(state.decode_units),
-            len(state.prefill_units_by_group),
+            len(state.prefill_units_by_domain),
             routing_key,
         )
 
@@ -913,13 +900,13 @@ class PDRouter(RoutingInterface):
     def _select_prefill_unit(
         self, state: PDRouterState, decode_unit: RouteUnit, payload_hash: int
     ) -> Optional[RouteUnit]:
-        prefill_units = state.prefill_units_by_group.get(decode_unit.role_group_id, {})
+        prefill_units = state.prefill_units_by_domain.get(decode_unit.domain, {})
         return self._select_unit_from_ring(
             state,
             payload_hash,
             prefill_units,
-            state.hash_to_prefill_unit_id_by_group.get(decode_unit.role_group_id, {}),
-            state.prefill_sorted_hashes_by_group.get(decode_unit.role_group_id, []),
+            state.hash_to_prefill_unit_id_by_domain.get(decode_unit.domain, {}),
+            state.prefill_sorted_hashes_by_domain.get(decode_unit.domain, []),
         )
 
     async def route_request(
@@ -959,15 +946,15 @@ class PDRouter(RoutingInterface):
             prefill_unit = self._select_prefill_unit(state, decode_unit, payload_hash)
             if prefill_unit is None:
                 logger.error(
-                    "PDRouter: No ready prefill unit in RoleGroup %s for %s",
-                    decode_unit.role_group_id,
+                    "PDRouter: No ready prefill unit in domain %s for %s",
+                    decode_unit.domain,
                     routing_key,
                 )
                 return None
 
             logger.info(
-                "PDRouter: Selected role_group=%s prefill=%s decode=%s url=%s",
-                decode_unit.role_group_id,
+                "PDRouter: Selected domain=%s prefill=%s decode=%s url=%s",
+                decode_unit.domain,
                 prefill_unit.index,
                 decode_unit.index,
                 decode_unit.url,

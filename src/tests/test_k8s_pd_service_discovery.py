@@ -1,6 +1,8 @@
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_router.service_discovery import (
     EndpointInfo,
     K8sPodIPServiceDiscovery,
@@ -18,6 +20,20 @@ def make_pod(labels=None, annotations=None):
     )
 
 
+def test_endpoint_info_rejects_deprecated_pd_count_metadata():
+    with pytest.raises(TypeError):
+        EndpointInfo(
+            url="http://10.0.0.1:9000",
+            model_names=["llama"],
+            Id="deprecated",
+            added_timestamp=0,
+            model_label="llama",
+            sleep=False,
+            prefill_count=1,
+            decode_count=1,
+        )
+
+
 def test_k8s_service_discovery_reads_group_target_static_metadata_from_pod():
     discovery = object.__new__(K8sPodIPServiceDiscovery)
     pod = make_pod(
@@ -30,29 +46,19 @@ def test_k8s_service_discovery_reads_group_target_static_metadata_from_pod():
         },
     )
 
-    assert discovery._get_role_group_id(pod) == "endpoint-collocated-0"
+    assert discovery._get_pd_domain(pod) == "endpoint-collocated-0"
     assert discovery._get_pd_deployment_type(pod) == "group"
     assert discovery._get_pd_sidecar_port(pod) == 9000
-    assert discovery._get_pd_metadata(pod, "pd") == (
-        "endpoint-collocated-0",
-        "pod-uid-0",
-        "endpoint-collocated-0",
-        9000,
-    )
+    assert discovery._get_pd_metadata(pod, "pd") == ("endpoint-collocated-0", 9000)
 
 
 def test_k8s_service_discovery_rejects_incomplete_pd_metadata():
     discovery = object.__new__(K8sPodIPServiceDiscovery)
     pod = make_pod(labels={"routing_logic": "pd"})
 
-    assert discovery._get_role_group_id(pod) == "endpoint-collocated-0"
+    assert discovery._get_pd_domain(pod) == "endpoint-collocated-0"
     assert discovery._get_pd_sidecar_port(pod) is None
-    assert discovery._get_pd_metadata(pod, "pd") == (
-        "endpoint-collocated-0",
-        "pod-uid-0",
-        "endpoint-collocated-0",
-        None,
-    )
+    assert discovery._get_pd_metadata(pod, "pd") == ("endpoint-collocated-0", None)
 
 
 def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
@@ -66,7 +72,7 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
     discovery.app = SimpleNamespace(state=SimpleNamespace(event_loop=None))
     discovery._trigger_callbacks = lambda *args: None
     discovery.initialize_client_sessions = lambda: None
-    discovery._get_model_info = lambda engine_ip, port=None: {}
+    discovery._get_model_info = lambda engine_ip: {}
     discovery._check_engine_sleep_mode = lambda engine_name: False
 
     discovery._add_engine(
@@ -77,8 +83,6 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
         workspace="ws",
         endpoint="ep",
         routing_logic="pd",
-        role_group_id="endpoint-collocated-0",
-        group_uid="pod-uid-0",
         domain="endpoint-collocated-0",
         pd_sidecar_port=9000,
         pd_topology=SimpleNamespace(
@@ -94,20 +98,18 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
     endpoints = discovery.get_endpoint_info()
 
     assert len(endpoints) == 3
-    assert {endpoint.pd_role for endpoint in endpoints} == {"prefill", "decode"}
+    assert {endpoint.role for endpoint in endpoints} == {"prefill", "decode"}
     assert {endpoint.url for endpoint in endpoints} == {"http://10.0.0.1:9000"}
     assert {
-        (endpoint.pd_role, endpoint.pd_rank, endpoint.route_meta.get("prefill_index"))
+        (endpoint.role, endpoint.rank)
         for endpoint in endpoints
-        if endpoint.pd_role == "prefill"
-    } == {("prefill", 0, 0), ("prefill", 1, 1)}
+        if endpoint.role == "prefill"
+    } == {("prefill", 0), ("prefill", 1)}
     assert {
-        (endpoint.pd_role, endpoint.pd_rank, endpoint.route_meta.get("decode_index"))
+        (endpoint.role, endpoint.rank)
         for endpoint in endpoints
-        if endpoint.pd_role == "decode"
-    } == {("decode", 0, 0)}
-    assert {endpoint.group_id for endpoint in endpoints} == {"endpoint-collocated-0"}
-    assert {endpoint.group_uid for endpoint in endpoints} == {"pod-uid-0"}
+        if endpoint.role == "decode"
+    } == {("decode", 0)}
     assert {endpoint.domain for endpoint in endpoints} == {"endpoint-collocated-0"}
 
 
@@ -123,8 +125,8 @@ def test_k8s_service_discovery_deletes_all_expanded_group_endpoints():
             sleep=False,
             pod_name="pod-0",
             routing_logic="pd",
-            pd_role="prefill",
-            pd_rank=0,
+            role="prefill",
+            rank=0,
         ),
         "pod-0:decode:0": EndpointInfo(
             url="http://10.0.0.1:9000",
@@ -135,8 +137,8 @@ def test_k8s_service_discovery_deletes_all_expanded_group_endpoints():
             sleep=False,
             pod_name="pod-0",
             routing_logic="pd",
-            pd_role="decode",
-            pd_rank=0,
+            role="decode",
+            rank=0,
         ),
     }
     discovery.available_engines_lock = threading.Lock()
@@ -164,13 +166,9 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
             workspace="ws",
             endpoint="ep",
             routing_logic="pd",
-            role_group_id="rg-0",
-            group_id="rg-0",
-            group_uid="pod-uid-0",
             domain="pod-0",
-            pd_role="prefill",
-            pd_rank=0,
-            route_meta={"prefill_index": 0},
+            role="prefill",
+            rank=0,
         )
     }
     discovery.available_engines_lock = threading.Lock()
@@ -190,8 +188,6 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
         workspace,
         endpoint,
         routing_logic,
-        role_group_id,
-        group_uid,
         domain,
         pd_sidecar_port,
         pd_topology,
@@ -200,8 +196,6 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
             (
                 "add",
                 engine_name,
-                role_group_id,
-                group_uid,
                 domain,
                 pd_sidecar_port,
                 tuple((unit.role, unit.rank) for unit in pd_topology.units),
@@ -221,8 +215,6 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
         workspace="ws",
         endpoint="ep",
         routing_logic="pd",
-        role_group_id="rg-0",
-        group_uid="pod-uid-0",
         domain="pod-0",
         pd_sidecar_port=9000,
         pd_topology=SimpleNamespace(
@@ -239,8 +231,6 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
         (
             "add",
             "pod-0",
-            "rg-0",
-            "pod-uid-0",
             "pod-0",
             9000,
             (("prefill", 0), ("decode", 0)),
