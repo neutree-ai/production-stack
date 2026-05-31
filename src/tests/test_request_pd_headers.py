@@ -6,13 +6,16 @@ from vllm_router.services.request_service.request import process_request
 
 
 class RequestStatsMonitor:
-    def on_new_request(self, *args):
+    def __init__(self):
+        self.new_request = None
+
+    def on_new_request(self, *args, **kwargs):
+        self.new_request = (args, kwargs)
+
+    def on_request_response(self, *args, **kwargs):
         pass
 
-    def on_request_response(self, *args):
-        pass
-
-    def on_request_complete(self, *args):
+    def on_request_complete(self, *args, **kwargs):
         pass
 
 
@@ -45,6 +48,7 @@ class FakeClient:
 @pytest.mark.asyncio
 async def test_process_request_forwards_pd_route_headers_to_backend():
     client = FakeClient()
+    stats_monitor = RequestStatsMonitor()
     request = SimpleNamespace(
         method="POST",
         headers={
@@ -56,7 +60,7 @@ async def test_process_request_forwards_pd_route_headers_to_backend():
         },
         app=SimpleNamespace(
             state=SimpleNamespace(
-                request_stats_monitor=RequestStatsMonitor(),
+                request_stats_monitor=stats_monitor,
                 semantic_cache_available=False,
                 aiohttp_client_wrapper=lambda: client,
             )
@@ -75,6 +79,10 @@ async def test_process_request_forwards_pd_route_headers_to_backend():
             "X-Neutree-PD-Prefill-Index": "1",
             "X-Neutree-PD-Decode-Index": "0",
         },
+        route_stats_metadata={
+            "pd_prefill_unit_id": "rg-0:prefill:1:http://10.0.0.1:9000",
+            "pd_decode_unit_id": "rg-0:decode:0:http://10.0.0.1:9000",
+        },
     )
 
     headers, status = await anext(stream)
@@ -89,3 +97,8 @@ async def test_process_request_forwards_pd_route_headers_to_backend():
     assert client.headers["X-Neutree-PD-Role-Group"] == "rg-0"
     assert client.headers["X-Neutree-PD-Prefill-Index"] == "1"
     assert client.headers["X-Neutree-PD-Decode-Index"] == "0"
+    assert stats_monitor.new_request[1] == {
+        "pd_prefill_unit_id": "rg-0:prefill:1:http://10.0.0.1:9000",
+        "pd_decode_unit_id": "rg-0:decode:0:http://10.0.0.1:9000",
+        "pd_track_both_units": True,
+    }

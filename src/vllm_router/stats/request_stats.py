@@ -14,7 +14,7 @@
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from vllm_router.log import init_logger
 
@@ -145,11 +145,27 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
 
         # Track active requests per engine (engine_url -> Set of request_ids)
         self.active_requests: Dict[str, Set[str]] = {}
+        # Track active requests per expanded P/D unit (unit_id -> Set of request_ids)
+        self.active_pd_unit_requests: Dict[str, Set[str]] = {}
+        # Remember selected P/D units and current active unit for each request.
+        self.pd_request_units: Dict[
+            Tuple[str, str], Tuple[Optional[str], Optional[str]]
+        ] = {}
+        self.active_pd_request_unit: Dict[Tuple[str, str], str] = {}
+        self.pd_track_both_units_requests: Set[Tuple[str, str]] = set()
 
         self.first_query_time: float = None
         self._initialized = True
 
-    def on_new_request(self, engine_url: str, request_id: str, timestamp: float):
+    def on_new_request(
+        self,
+        engine_url: str,
+        request_id: str,
+        timestamp: float,
+        pd_prefill_unit_id: Optional[str] = None,
+        pd_decode_unit_id: Optional[str] = None,
+        pd_track_both_units: bool = False,
+    ):
         """
         Tell the monitor that a new request has been created.
 
@@ -157,6 +173,9 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             engine_url: The URL of the serving engine
             request_id: The global request ID
             timestamp: the timestamp when the request was created
+            pd_prefill_unit_id: The selected P/D prefill unit id, if applicable
+            pd_decode_unit_id: The selected P/D decode unit id, if applicable
+            pd_track_both_units: Track both units for requests without a token boundary
         """
         self.request_start_time[(engine_url, request_id)] = timestamp
 
@@ -180,8 +199,37 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             self.active_requests[engine_url] = set()
         self.active_requests[engine_url].add(request_id)
 
+        request_key = (engine_url, request_id)
+        if pd_prefill_unit_id or pd_decode_unit_id:
+            self.pd_request_units[request_key] = (
+                pd_prefill_unit_id,
+                pd_decode_unit_id,
+            )
         if self.first_query_time is None:
             self.first_query_time = timestamp
+
+        if pd_track_both_units and (pd_prefill_unit_id or pd_decode_unit_id):
+            self.pd_track_both_units_requests.add(request_key)
+            if pd_prefill_unit_id:
+                self.active_pd_unit_requests.setdefault(pd_prefill_unit_id, set()).add(
+                    request_id
+                )
+            if pd_decode_unit_id:
+                self.active_pd_unit_requests.setdefault(pd_decode_unit_id, set()).add(
+                    request_id
+                )
+            return
+
+        if pd_prefill_unit_id:
+            self.active_pd_unit_requests.setdefault(pd_prefill_unit_id, set()).add(
+                request_id
+            )
+            self.active_pd_request_unit[request_key] = pd_prefill_unit_id
+        elif pd_decode_unit_id:
+            self.active_pd_unit_requests.setdefault(pd_decode_unit_id, set()).add(
+                request_id
+            )
+            self.active_pd_request_unit[request_key] = pd_decode_unit_id
 
     def on_request_response(self, engine_url: str, request_id: str, timestamp: float):
         """
@@ -212,6 +260,23 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
         ttft = timestamp - self.request_start_time[(engine_url, request_id)]
         self.ttft_monitors[engine_url].update(timestamp, ttft)
 
+        request_key = (engine_url, request_id)
+        if request_key in self.pd_track_both_units_requests:
+            return
+
+        pd_prefill_unit_id, pd_decode_unit_id = self.pd_request_units.get(
+            request_key, (None, None)
+        )
+        if pd_prefill_unit_id:
+            self.active_pd_unit_requests.get(pd_prefill_unit_id, set()).discard(
+                request_id
+            )
+        if pd_decode_unit_id:
+            self.active_pd_unit_requests.setdefault(pd_decode_unit_id, set()).add(
+                request_id
+            )
+            self.active_pd_request_unit[request_key] = pd_decode_unit_id
+
     def on_request_complete(self, engine_url: str, request_id: str, timestamp: float):
         """
         Tell the monitor that a request has been completed.
@@ -236,6 +301,23 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
         # Remove from active requests
         if engine_url in self.active_requests:
             self.active_requests[engine_url].discard(request_id)
+
+        request_key = (engine_url, request_id)
+        active_unit_id = self.active_pd_request_unit.pop(request_key, None)
+        if active_unit_id:
+            self.active_pd_unit_requests.get(active_unit_id, set()).discard(request_id)
+        pd_prefill_unit_id, pd_decode_unit_id = self.pd_request_units.pop(
+            request_key, (None, None)
+        )
+        self.pd_track_both_units_requests.discard(request_key)
+        if pd_prefill_unit_id:
+            self.active_pd_unit_requests.get(pd_prefill_unit_id, set()).discard(
+                request_id
+            )
+        if pd_decode_unit_id:
+            self.active_pd_unit_requests.get(pd_decode_unit_id, set()).discard(
+                request_id
+            )
 
     def on_request_swapped(self, engine_url: str, request_id: str, timestamp: float):
         # This function should be called if a request is determined to be swapped from GPU to CPU.
@@ -354,6 +436,18 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             The number of active requests
         """
         return len(self.active_requests.get(engine_url, set()))
+
+    def get_active_pd_unit_requests(self, unit_id: str) -> Set[str]:
+        """
+        Get the set of active request IDs for an expanded P/D unit.
+        """
+        return self.active_pd_unit_requests.get(unit_id, set()).copy()
+
+    def get_active_pd_unit_request_count(self, unit_id: str) -> int:
+        """
+        Get the count of active requests for an expanded P/D unit.
+        """
+        return len(self.active_pd_unit_requests.get(unit_id, set()))
 
     def is_request_active(self, engine_url: str, request_id: str) -> bool:
         """

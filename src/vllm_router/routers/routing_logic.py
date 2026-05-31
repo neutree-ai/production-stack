@@ -587,6 +587,13 @@ class PDRouteDecision:
             "X-Neutree-PD-Decode-Index": str(self.decode.rank),
         }
 
+    @property
+    def stats_metadata(self) -> Dict[str, str]:
+        return {
+            "pd_prefill_unit_id": self.prefill.unit_id,
+            "pd_decode_unit_id": self.decode.unit_id,
+        }
+
 
 @dataclass
 class PDRouterState:
@@ -602,8 +609,6 @@ class PDRouterState:
     prefill_units_by_domain: Dict[str, Dict[str, RouteUnit]] = field(
         default_factory=dict
     )
-    decode_unit_counts_by_url: Dict[str, int] = field(default_factory=dict)
-    prefill_unit_counts_by_url: Dict[str, int] = field(default_factory=dict)
     last_sync_time: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -631,6 +636,9 @@ class PDRouter(RoutingInterface):
         self._max_user_messages_for_cache = max_user_messages_for_cache
         self._states: Dict[str, PDRouterState] = {}
         self._states_creation_lock = threading.Lock()
+        self._service_discovery = None
+        self._event_sync_enabled = False
+        self._register_service_discovery_callback()
         self._initialized = True
 
         logger.info(
@@ -640,6 +648,37 @@ class PDRouter(RoutingInterface):
             load_factor,
             max_user_messages_for_cache,
         )
+
+    def close(self) -> None:
+        if self._service_discovery is None:
+            return
+        try:
+            self._service_discovery.unregister_callback(
+                self._on_service_discovery_event
+            )
+        except Exception as e:
+            logger.warning("PDRouter: Could not unregister service callback: %s", e)
+        self._service_discovery = None
+
+    def _register_service_discovery_callback(self) -> None:
+        try:
+            sd = get_service_discovery()
+            if hasattr(sd, "register_callback"):
+                sd.register_callback(self._on_service_discovery_event)
+                self._service_discovery = sd
+                self._event_sync_enabled = True
+                logger.info("Registered PDRouter callback with service discovery")
+            else:
+                logger.warning(
+                    "Service discovery does not support callbacks. "
+                    "P/D route units will be reconciled from request endpoints."
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not register PDRouter service discovery callback: %s. "
+                "P/D route units will be reconciled from request endpoints.",
+                e,
+            )
 
     def _get_routing_key(self, endpoint_info: EndpointInfo) -> str:
         workspace = endpoint_info.workspace
@@ -688,11 +727,34 @@ class PDRouter(RoutingInterface):
             return None
         return parsed if parsed >= 0 else None
 
+    def _route_unit_from_endpoint(self, endpoint: EndpointInfo) -> Optional[RouteUnit]:
+        role = self._endpoint_role(endpoint)
+        rank = self._endpoint_rank(endpoint)
+        if role is None or rank is None:
+            logger.debug(
+                "PDRouter: Skipping non-expanded P/D endpoint %s role=%s rank=%s",
+                endpoint.url,
+                role,
+                rank,
+            )
+            return None
+
+        return RouteUnit(
+            domain=self._endpoint_domain(endpoint),
+            role=role,
+            rank=rank,
+            url=endpoint.url,
+            endpoint_info=endpoint,
+        )
+
+    def _state_endpoint_infos(self, state: PDRouterState) -> List[EndpointInfo]:
+        endpoints = [unit.endpoint_info for unit in state.decode_units.values()]
+        for units_by_id in state.prefill_units_by_domain.values():
+            endpoints.extend(unit.endpoint_info for unit in units_by_id.values())
+        return endpoints
+
     def _add_decode_unit_to_ring(self, state: PDRouterState, unit: RouteUnit) -> None:
         state.decode_units[unit.unit_id] = unit
-        state.decode_unit_counts_by_url[unit.url] = (
-            state.decode_unit_counts_by_url.get(unit.url, 0) + 1
-        )
 
         for i in range(self._virtual_nodes):
             virtual_node_key = f"{unit.unit_id}:{i}"
@@ -702,9 +764,6 @@ class PDRouter(RoutingInterface):
 
     def _add_prefill_unit_to_ring(self, state: PDRouterState, unit: RouteUnit) -> None:
         state.prefill_units_by_domain.setdefault(unit.domain, {})[unit.unit_id] = unit
-        state.prefill_unit_counts_by_url[unit.url] = (
-            state.prefill_unit_counts_by_url.get(unit.url, 0) + 1
-        )
 
         hash_to_unit_id = state.hash_to_prefill_unit_id_by_domain.setdefault(
             unit.domain, {}
@@ -727,32 +786,15 @@ class PDRouter(RoutingInterface):
         state.prefill_sorted_hashes_by_domain.clear()
         state.decode_units.clear()
         state.prefill_units_by_domain.clear()
-        state.decode_unit_counts_by_url.clear()
-        state.prefill_unit_counts_by_url.clear()
 
         for endpoint in sorted(endpoints, key=lambda e: e.url):
-            domain = self._endpoint_domain(endpoint)
-            role = self._endpoint_role(endpoint)
-            rank = self._endpoint_rank(endpoint)
-            if role is None or rank is None:
-                logger.debug(
-                    "PDRouter: Skipping non-expanded P/D endpoint %s role=%s rank=%s",
-                    endpoint.url,
-                    role,
-                    rank,
-                )
+            unit = self._route_unit_from_endpoint(endpoint)
+            if unit is None:
                 continue
 
-            unit = RouteUnit(
-                domain=domain,
-                role=role,
-                rank=rank,
-                url=endpoint.url,
-                endpoint_info=endpoint,
-            )
-            if role == "prefill":
+            if unit.role == "prefill":
                 self._add_prefill_unit_to_ring(state, unit)
-            elif role == "decode":
+            elif unit.role == "decode":
                 self._add_decode_unit_to_ring(
                     state,
                     unit,
@@ -813,16 +855,11 @@ class PDRouter(RoutingInterface):
             from vllm_router.stats.request_stats import get_request_stats_monitor
 
             monitor = get_request_stats_monitor()
-            active = monitor.get_active_request_count(unit.url)
+            active = monitor.get_active_pd_unit_request_count(unit.unit_id)
         except Exception as e:
-            logger.warning("PDRouter: Could not get load for %s: %s", unit.url, e)
+            logger.warning("PDRouter: Could not get load for %s: %s", unit.unit_id, e)
             return None
-
-        if unit.role == "prefill":
-            units_on_url = state.prefill_unit_counts_by_url.get(unit.url, 1)
-        else:
-            units_on_url = state.decode_unit_counts_by_url.get(unit.url, 1)
-        return active / max(units_on_url, 1)
+        return active
 
     def _get_total_unit_load(
         self, state: PDRouterState, units: List[RouteUnit]
@@ -909,6 +946,45 @@ class PDRouter(RoutingInterface):
             state.prefill_sorted_hashes_by_domain.get(decode_unit.domain, []),
         )
 
+    def _on_service_discovery_event(
+        self,
+        event_type: ServiceDiscoveryEventType,
+        engine_name: str,
+        endpoint_info: Optional[EndpointInfo],
+    ) -> None:
+        self._event_sync_enabled = True
+        if endpoint_info is None:
+            return
+        if endpoint_info.routing_logic and endpoint_info.routing_logic != "pd":
+            return
+
+        event_unit = self._route_unit_from_endpoint(endpoint_info)
+        if event_unit is None:
+            return
+
+        routing_key = self._get_routing_key(endpoint_info)
+        state = self._get_or_create_state(routing_key)
+        with state.lock:
+            endpoints = self._state_endpoint_infos(state)
+            endpoints = [
+                endpoint
+                for endpoint in endpoints
+                if (unit := self._route_unit_from_endpoint(endpoint)) is not None
+                and unit.unit_id != event_unit.unit_id
+            ]
+            if event_type == ServiceDiscoveryEventType.ENGINE_ADDED:
+                endpoints.append(endpoint_info)
+            elif event_type != ServiceDiscoveryEventType.ENGINE_DELETED:
+                return
+
+            self._sync_route_units(routing_key, state, endpoints)
+            logger.debug(
+                "PDRouter: Applied %s for %s on %s",
+                event_type.value,
+                engine_name,
+                event_unit.unit_id,
+            )
+
     async def route_request(
         self,
         endpoints: List[EndpointInfo],
@@ -925,7 +1001,12 @@ class PDRouter(RoutingInterface):
         state = self._get_or_create_state(routing_key)
 
         with state.lock:
-            self._sync_route_units(routing_key, state, endpoints)
+            if (
+                not self._event_sync_enabled
+                or not state.decode_units
+                or not state.prefill_units_by_domain
+            ):
+                self._sync_route_units(routing_key, state, endpoints)
 
             if request_json is None:
                 try:

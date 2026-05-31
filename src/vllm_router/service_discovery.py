@@ -920,57 +920,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             resolver = SidecarHTTPTopologyResolver(self.health_check_timeout_seconds)
         return resolver.resolve(topology_url)
 
-    def _engine_needs_refresh(
-        self,
-        engine_name: str,
-        engine_ip: str,
-        model_names: List[str],
-        model_label: Optional[str],
-        workspace: Optional[str],
-        endpoint: Optional[str],
-        routing_logic: Optional[str],
-    ) -> bool:
-        if routing_logic == PD_ROUTING_LOGIC:
-            domain, pd_sidecar_port = self._get_pd_metadata_for_engine(
-                engine_name, routing_logic
-            )
-            pd_topology = self._get_pd_topology(engine_ip, pd_sidecar_port)
-            target_port = pd_sidecar_port or self.port
-            target_url = f"http://{engine_ip}:{target_port}"
-            expected = self._build_pd_endpoint_signatures(
-                target_url,
-                model_names,
-                model_label,
-                workspace,
-                endpoint,
-                routing_logic,
-                domain,
-                pd_topology,
-            )
-            with self.available_engines_lock:
-                current = {
-                    self._endpoint_signature(endpoint_info)
-                    for endpoint_info in self.available_engines.values()
-                    if endpoint_info.pod_name == engine_name
-                }
-            return current != expected
-
-        target_url = f"http://{engine_ip}:{self.port}"
-        with self.available_engines_lock:
-            existing = self.available_engines.get(engine_name)
-
-        if existing is None:
-            return True
-
-        return (
-            existing.url != target_url
-            or existing.model_names != model_names
-            or existing.model_label != model_label
-            or existing.workspace != workspace
-            or existing.endpoint != endpoint
-            or existing.routing_logic != routing_logic
-        )
-
     @staticmethod
     def _pd_unit_engine_name(engine_name: str, unit: PDTopologyUnit) -> str:
         return f"{engine_name}:{unit.role}:{unit.rank}"
@@ -1010,48 +959,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             rank=unit.rank,
         )
         return unit_engine_name, endpoint_info
-
-    @staticmethod
-    def _endpoint_signature(endpoint_info: EndpointInfo) -> tuple:
-        return (
-            endpoint_info.url,
-            tuple(endpoint_info.model_names),
-            endpoint_info.model_label,
-            endpoint_info.workspace,
-            endpoint_info.endpoint,
-            endpoint_info.routing_logic,
-            endpoint_info.domain,
-            endpoint_info.role,
-            endpoint_info.rank,
-        )
-
-    def _build_pd_endpoint_signatures(
-        self,
-        target_url: str,
-        model_names: List[str],
-        model_label: Optional[str],
-        workspace: Optional[str],
-        endpoint: Optional[str],
-        routing_logic: Optional[str],
-        domain: Optional[str],
-        pd_topology: Optional[PDTopology],
-    ) -> Set[tuple]:
-        if pd_topology is None:
-            return set()
-        return {
-            (
-                target_url,
-                tuple(model_names),
-                model_label,
-                workspace,
-                endpoint,
-                routing_logic,
-                domain,
-                unit.role,
-                unit.rank,
-            )
-            for unit in pd_topology.units
-        }
 
     def _watch_engines(self):
         while self.running:
@@ -1300,26 +1207,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     endpoint,
                     routing_logic,
                 )
-            elif is_now_available and was_available:
-                if self._engine_needs_refresh(
-                    engine_name,
-                    engine_ip,
-                    model_names,
-                    model_label,
-                    workspace,
-                    endpoint,
-                    routing_logic,
-                ):
-                    self._delete_engine(engine_name)
-                    self._add_engine(
-                        engine_name,
-                        engine_ip,
-                        model_names,
-                        model_label,
-                        workspace,
-                        endpoint,
-                        routing_logic,
-                    )
             elif not is_now_available and was_available:
                 # Engine became unavailable: trigger ENGINE_DELETED
                 self._delete_engine(engine_name)

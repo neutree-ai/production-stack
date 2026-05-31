@@ -86,6 +86,7 @@ async def process_request(
     background_tasks: BackgroundTasks,
     debug_request=None,
     route_headers: Optional[dict[str, str]] = None,
+    route_stats_metadata: Optional[dict[str, str]] = None,
 ):
     """
     Process a request by sending it to the chosen backend.
@@ -107,10 +108,6 @@ async def process_request(
     """
     first_token = False
     total_len = 0
-    start_time = time.time()
-    request.app.state.request_stats_monitor.on_new_request(
-        backend_url, request_id, start_time
-    )
     # Check if this is a streaming request
     try:
         request_json = json.loads(body)
@@ -118,6 +115,17 @@ async def process_request(
     except JSONDecodeError:
         # If we can't parse the body as JSON, assume it's not streaming
         raise HTTPException(status=400, detail="Request body is not JSON parsable.")
+
+    start_time = time.time()
+    route_stats_metadata = route_stats_metadata or {}
+    if route_stats_metadata and not is_streaming:
+        route_stats_metadata = {
+            **route_stats_metadata,
+            "pd_track_both_units": True,
+        }
+    request.app.state.request_stats_monitor.on_new_request(
+        backend_url, request_id, start_time, **route_stats_metadata
+    )
 
     # sanitize the request headers
     headers = {
@@ -350,6 +358,7 @@ async def route_general_request(
         )
 
     route_headers = None
+    route_stats_metadata = None
     if route_result is None:
         return JSONResponse(
             status_code=503,
@@ -359,6 +368,7 @@ async def route_general_request(
     if hasattr(route_result, "url"):
         server_url = route_result.url
         route_headers = getattr(route_result, "headers", None)
+        route_stats_metadata = getattr(route_result, "stats_metadata", None)
     else:
         server_url = route_result
 
@@ -385,6 +395,7 @@ async def route_general_request(
         endpoint,
         background_tasks,
         route_headers=route_headers,
+        route_stats_metadata=route_stats_metadata,
     )
     headers, status = await anext(stream_generator)
     headers_dict = {key: value for key, value in headers.items()}

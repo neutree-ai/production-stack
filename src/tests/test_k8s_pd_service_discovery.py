@@ -153,7 +153,7 @@ def test_k8s_service_discovery_deletes_all_expanded_group_endpoints():
     assert deleted == ["pod-0:prefill:0", "pod-0:decode:0"]
 
 
-def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes():
+def test_k8s_service_discovery_ignores_ready_modified_pod_without_state_change():
     discovery = object.__new__(K8sPodIPServiceDiscovery)
     discovery.port = 8000
     discovery.available_engines = {
@@ -175,18 +175,6 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
     }
     discovery.available_engines_lock = threading.Lock()
     calls = []
-    topology = SimpleNamespace(
-        group_id="rg-0",
-        units=[
-            SimpleNamespace(role="prefill", rank=0),
-            SimpleNamespace(role="decode", rank=0),
-        ],
-    )
-    discovery._get_pd_metadata_for_engine = lambda engine_name, routing_logic: (
-        "pod-0",
-        9000,
-    )
-    discovery._get_pd_topology = lambda engine_ip, pd_sidecar_port: topology
 
     def delete_engine(engine_name):
         calls.append(("delete", engine_name))
@@ -220,7 +208,4 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
         routing_logic="pd",
     )
 
-    assert calls == [
-        ("delete", "pod-0"),
-        ("add", "pod-0"),
-    ]
+    assert calls == []
