@@ -559,13 +559,13 @@ class RouteUnit:
 
     domain: str
     role: str
-    index: int
+    rank: int
     url: str
     endpoint_info: EndpointInfo
 
     @property
     def unit_id(self) -> str:
-        return f"{self.domain}:{self.role}:{self.index}:{self.url}"
+        return f"{self.domain}:{self.role}:{self.rank}:{self.url}"
 
 
 @dataclass(frozen=True)
@@ -583,8 +583,8 @@ class PDRouteDecision:
     def headers(self) -> Dict[str, str]:
         return {
             "X-Neutree-PD-Role-Group": self.decode.domain,
-            "X-Neutree-PD-Prefill-Index": str(self.prefill.index),
-            "X-Neutree-PD-Decode-Index": str(self.decode.index),
+            "X-Neutree-PD-Prefill-Index": str(self.prefill.rank),
+            "X-Neutree-PD-Decode-Index": str(self.decode.rank),
         }
 
 
@@ -614,7 +614,7 @@ class PDRouter(RoutingInterface):
 
     Discovery expands direct/group targets into one EndpointInfo per schedulable
     P/D unit. The router only consumes those unit endpoints and sends the
-    selected unit indices to the group entrypoint via X-Neutree-PD-* headers.
+    selected unit ranks to the group entrypoint via X-Neutree-PD-* headers.
     """
 
     def __init__(
@@ -746,7 +746,7 @@ class PDRouter(RoutingInterface):
             unit = RouteUnit(
                 domain=domain,
                 role=role,
-                index=rank,
+                rank=rank,
                 url=endpoint.url,
                 endpoint_info=endpoint,
             )
@@ -955,8 +955,8 @@ class PDRouter(RoutingInterface):
             logger.info(
                 "PDRouter: Selected domain=%s prefill=%s decode=%s url=%s",
                 decode_unit.domain,
-                prefill_unit.index,
-                decode_unit.index,
+                prefill_unit.rank,
+                decode_unit.rank,
                 decode_unit.url,
             )
             return PDRouteDecision(prefill=prefill_unit, decode=decode_unit)

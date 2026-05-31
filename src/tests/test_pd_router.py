@@ -63,8 +63,8 @@ async def test_pd_router_selects_prefill_and_decode_from_same_domain():
     assert decision.prefill.domain == decision.decode.domain
     assert decision.prefill.endpoint_info.role == "prefill"
     assert decision.decode.endpoint_info.role == "decode"
-    assert decision.headers["X-Neutree-PD-Prefill-Index"] == str(decision.prefill.index)
-    assert decision.headers["X-Neutree-PD-Decode-Index"] == str(decision.decode.index)
+    assert decision.headers["X-Neutree-PD-Prefill-Index"] == str(decision.prefill.rank)
+    assert decision.headers["X-Neutree-PD-Decode-Index"] == str(decision.decode.rank)
     assert decision.headers["X-Neutree-PD-Role-Group"] == decision.decode.domain
 
 
@@ -119,7 +119,7 @@ async def test_pd_router_prefill_uses_chwbl_within_selected_domain(monkeypatch):
     ]
 
     def fake_get_unit_load(state, unit):
-        if unit.role == "prefill" and unit.index == 0:
+        if unit.role == "prefill" and unit.rank == 0:
             return 100
         return 0
 
@@ -134,7 +134,7 @@ async def test_pd_router_prefill_uses_chwbl_within_selected_domain(monkeypatch):
     )
 
     assert decision is not None
-    assert decision.prefill.index == 1
+    assert decision.prefill.rank == 1
     assert decision.prefill.domain == decision.decode.domain
 
     cleanup_routing_logic()
