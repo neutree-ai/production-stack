@@ -612,10 +612,9 @@ class PDRouter(RoutingInterface):
     """
     Route collocated P/D requests by selecting decode first, then prefill in the same RoleGroup.
 
-    K8s service discovery provides one EndpointInfo per collocated Pod. Each Pod is
-    expanded into logical prefill/decode RouteUnits using the P/D metadata carried on
-    EndpointInfo. The selected Pod sidecar receives the chosen unit indices via
-    X-Neutree-PD-* headers.
+    Discovery expands direct/group targets into one EndpointInfo per schedulable
+    P/D unit. The router only consumes those unit endpoints and sends the
+    selected unit indices to the group entrypoint via X-Neutree-PD-* headers.
     """
 
     def __init__(
@@ -676,22 +675,29 @@ class PDRouter(RoutingInterface):
 
     def _endpoint_role_group_id(self, endpoint: EndpointInfo) -> str:
         return (
-            endpoint.role_group_id or endpoint.pod_name or endpoint.Id or endpoint.url
+            getattr(endpoint, "group_id", None)
+            or endpoint.role_group_id
+            or endpoint.pod_name
+            or endpoint.Id
+            or endpoint.url
         )
 
-    def _endpoint_role_count(self, endpoint: EndpointInfo, field_name: str) -> int:
-        value = getattr(endpoint, field_name, 1)
+    def _endpoint_pd_role(self, endpoint: EndpointInfo) -> Optional[str]:
+        role = getattr(endpoint, "pd_role", None)
+        return role if role in {"prefill", "decode"} else None
+
+    def _endpoint_pd_rank(self, endpoint: EndpointInfo) -> Optional[int]:
+        rank = getattr(endpoint, "pd_rank", None)
+        if rank is None:
+            route_meta = getattr(endpoint, "route_meta", {}) or {}
+            role = self._endpoint_pd_role(endpoint)
+            if role is not None:
+                rank = route_meta.get(f"{role}_index")
         try:
-            parsed = int(value)
+            parsed = int(rank)
         except (TypeError, ValueError):
-            logger.warning(
-                "Invalid P/D %s value %s for %s, using 1",
-                field_name,
-                value,
-                endpoint.url,
-            )
-            return 1
-        return max(parsed, 0)
+            return None
+        return parsed if parsed >= 0 else None
 
     def _add_decode_unit_to_ring(self, state: PDRouterState, unit: RouteUnit) -> None:
         state.decode_units[unit.unit_id] = unit
@@ -739,31 +745,30 @@ class PDRouter(RoutingInterface):
 
         for endpoint in sorted(endpoints, key=lambda e: e.url):
             role_group_id = self._endpoint_role_group_id(endpoint)
-            prefill_count = self._endpoint_role_count(endpoint, "prefill_count")
-            decode_count = self._endpoint_role_count(endpoint, "decode_count")
-
-            for index in range(prefill_count):
-                self._add_prefill_unit_to_ring(
-                    state,
-                    RouteUnit(
-                        role_group_id=role_group_id,
-                        role="prefill",
-                        index=index,
-                        url=endpoint.url,
-                        endpoint_info=endpoint,
-                    ),
+            role = self._endpoint_pd_role(endpoint)
+            rank = self._endpoint_pd_rank(endpoint)
+            if role is None or rank is None:
+                logger.debug(
+                    "PDRouter: Skipping non-expanded P/D endpoint %s role=%s rank=%s",
+                    endpoint.url,
+                    role,
+                    rank,
                 )
+                continue
 
-            for index in range(decode_count):
+            unit = RouteUnit(
+                role_group_id=role_group_id,
+                role=role,
+                index=rank,
+                url=endpoint.url,
+                endpoint_info=endpoint,
+            )
+            if role == "prefill":
+                self._add_prefill_unit_to_ring(state, unit)
+            elif role == "decode":
                 self._add_decode_unit_to_ring(
                     state,
-                    RouteUnit(
-                        role_group_id=role_group_id,
-                        role="decode",
-                        index=index,
-                        url=endpoint.url,
-                        endpoint_info=endpoint,
-                    ),
+                    unit,
                 )
 
         state.last_sync_time = time.time()

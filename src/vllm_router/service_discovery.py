@@ -19,7 +19,7 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
 
 import aiohttp
@@ -90,6 +90,65 @@ class ModelInfo:
         }
 
 
+@dataclass(frozen=True)
+class PDTopologyUnit:
+    """Schedulable P/D unit returned by a topology source."""
+
+    role: str
+    rank: int
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PDTopologyUnit":
+        return cls(role=data.get("role"), rank=int(data.get("rank")))
+
+
+@dataclass(frozen=True)
+class PDTopology:
+    """Minimal P/D topology contract consumed by discovery."""
+
+    group_id: str
+    units: List[PDTopologyUnit]
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PDTopology":
+        units = [PDTopologyUnit.from_dict(unit) for unit in data.get("units", [])]
+        return cls(group_id=data.get("group_id"), units=units)
+
+
+class TopologyResolver(abc.ABC):
+    """Abstract topology source for direct/group discovery targets."""
+
+    @abc.abstractmethod
+    def resolve(self, target: str) -> Optional[PDTopology]:
+        raise NotImplementedError
+
+
+class SidecarHTTPTopologyResolver(TopologyResolver):
+    """Resolve P/D group topology from a sidecar HTTP endpoint."""
+
+    def __init__(self, timeout_seconds: int):
+        self.timeout_seconds = timeout_seconds
+
+    def resolve(self, target: str) -> Optional[PDTopology]:
+        try:
+            response = requests.get(target, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            topology = PDTopology.from_dict(response.json())
+        except Exception as e:
+            logger.warning("Failed to resolve P/D topology from %s: %s", target, e)
+            return None
+
+        valid_units = [
+            unit
+            for unit in topology.units
+            if unit.role in {"prefill", "decode"} and unit.rank >= 0
+        ]
+        if not topology.group_id or not valid_units:
+            logger.warning("Invalid P/D topology from %s: %s", target, topology)
+            return None
+        return PDTopology(group_id=topology.group_id, units=valid_units)
+
+
 @dataclass
 class EndpointInfo:
     # Endpoint's url
@@ -131,13 +190,23 @@ class EndpointInfo:
     # Routing logic
     routing_logic: Optional[str] = None
 
-    # P/D same-host role group metadata
+    # P/D group and rank metadata. Discovery expands group targets into one
+    # EndpointInfo per schedulable P/D unit before the router sees them.
+    group_id: Optional[str] = None
+    group_uid: Optional[str] = None
+    domain: Optional[str] = None
+    pd_role: Optional[str] = None
+    pd_rank: Optional[int] = None
+    route_meta: Dict[str, int] = field(default_factory=dict)
+
+    # Deprecated count-based metadata kept for compatibility with older callers.
+    # PDRouter no longer expands these counts on the request path.
     role_group_id: Optional[str] = None
     prefill_count: int = 1
     decode_count: int = 1
 
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, role_group_id={self.role_group_id}, prefill_count={self.prefill_count}, decode_count={self.decode_count})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, group_id={self.group_id}, group_uid={self.group_uid}, domain={self.domain}, pd_role={self.pd_role}, pd_rank={self.pd_rank}, route_meta={self.route_meta})"
 
     def get_base_models(self) -> List[str]:
         """
@@ -449,6 +518,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         self.label_selector = label_selector
         self.watcher_timeout_seconds = watcher_timeout_seconds
         self.health_check_timeout_seconds = health_check_timeout_seconds
+        self.topology_resolver = SidecarHTTPTopologyResolver(
+            timeout_seconds=health_check_timeout_seconds
+        )
         self.event_callbacks = event_callbacks or []
 
         # Init kubernetes watcher
@@ -786,53 +858,25 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         return parsed
 
     def _get_role_group_id(self, pod) -> str:
-        """
-        Get the stable P/D RoleGroup id from pod metadata.
+        """Get the stable P/D group id from Kubernetes object identity."""
+        return pod.metadata.name
 
-        Defaults to the pod name because one collocated Pod represents one
-        RoleGroup in the K8s same-host design.
-        """
-        return (
-            self._get_metadata_value(
-                pod,
-                [
-                    "neutree.ai/role-group-id",
-                    "role_group_id",
-                    "role-group-id",
-                ],
-            )
-            or pod.metadata.name
-        )
+    def _get_pd_group_uid(self, pod) -> Optional[str]:
+        return getattr(pod.metadata, "uid", None)
 
-    def _get_pd_role_counts(self, pod) -> tuple[Optional[int], Optional[int]]:
-        """
-        Get logical prefill/decode unit counts for a collocated P/D Pod.
-        """
-        prefill_count = self._parse_positive_int(
-            self._get_metadata_value(
-                pod,
-                [
-                    "neutree.ai/prefill-replicas",
-                    "neutree.ai/prefill-count",
-                    "prefill_replicas",
-                    "prefill_count",
-                ],
-            ),
-            "prefill_count",
+    def _get_pd_domain(self, pod) -> str:
+        return pod.metadata.name or self._get_pd_group_uid(pod)
+
+    def _get_pd_deployment_type(self, pod) -> Optional[str]:
+        return self._get_metadata_value(
+            pod,
+            [
+                "neutree.io/pd-deployment-type",
+                "neutree.ai/pd-deployment-type",
+                "pd_deployment_type",
+                "pd-deployment-type",
+            ],
         )
-        decode_count = self._parse_positive_int(
-            self._get_metadata_value(
-                pod,
-                [
-                    "neutree.ai/decode-replicas",
-                    "neutree.ai/decode-count",
-                    "decode_replicas",
-                    "decode_count",
-                ],
-            ),
-            "decode_count",
-        )
-        return prefill_count, decode_count
 
     def _get_pd_sidecar_port(self, pod) -> Optional[int]:
         """
@@ -841,6 +885,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         value = self._get_metadata_value(
             pod,
             [
+                "neutree.io/pd-sidecar-port",
                 "neutree.ai/pd-sidecar-port",
                 "pd_sidecar_port",
                 "pd-sidecar-port",
@@ -853,21 +898,33 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
     def _get_pd_metadata(
         self, pod, routing_logic: Optional[str]
-    ) -> tuple[Optional[str], Optional[int], Optional[int], Optional[int]]:
+    ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
         if routing_logic != PD_ROUTING_LOGIC:
             return None, None, None, None
 
         role_group_id = self._get_role_group_id(pod)
-        prefill_count, decode_count = self._get_pd_role_counts(pod)
+        group_uid = self._get_pd_group_uid(pod)
+        domain = self._get_pd_domain(pod)
         pd_sidecar_port = self._get_pd_sidecar_port(pod)
-        if prefill_count is None or decode_count is None or pd_sidecar_port is None:
+        if self._get_pd_deployment_type(pod) != "group" or pd_sidecar_port is None:
             logger.warning(
-                "P/D pod %s is missing valid routing metadata; marking unavailable",
+                "P/D pod %s is missing valid group routing metadata; marking unavailable",
                 pod.metadata.name,
             )
-            return role_group_id, None, None, None
+            return role_group_id, group_uid, domain, None
 
-        return role_group_id, prefill_count, decode_count, pd_sidecar_port
+        return role_group_id, group_uid, domain, pd_sidecar_port
+
+    def _get_pd_topology(
+        self, pod_ip: str, pd_sidecar_port: Optional[int]
+    ) -> Optional[PDTopology]:
+        if pd_sidecar_port is None:
+            return None
+        topology_url = f"http://{pod_ip}:{pd_sidecar_port}/v1/pd/topology"
+        resolver = getattr(self, "topology_resolver", None)
+        if resolver is None:
+            resolver = SidecarHTTPTopologyResolver(self.health_check_timeout_seconds)
+        return resolver.resolve(topology_url)
 
     def _engine_needs_refresh(
         self,
@@ -879,18 +936,41 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         endpoint: Optional[str],
         routing_logic: Optional[str],
         role_group_id: Optional[str],
-        prefill_count: Optional[int],
-        decode_count: Optional[int],
+        group_uid: Optional[str],
+        domain: Optional[str],
         pd_sidecar_port: Optional[int],
+        pd_topology: Optional[PDTopology],
     ) -> bool:
+        target_port = pd_sidecar_port or self.port
+        target_url = f"http://{engine_ip}:{target_port}"
+
+        if routing_logic == PD_ROUTING_LOGIC:
+            expected = self._build_pd_endpoint_signatures(
+                target_url,
+                model_names,
+                model_label,
+                workspace,
+                endpoint,
+                routing_logic,
+                role_group_id,
+                group_uid,
+                domain,
+                pd_topology,
+            )
+            with self.available_engines_lock:
+                current = {
+                    self._endpoint_signature(endpoint_info)
+                    for endpoint_info in self.available_engines.values()
+                    if endpoint_info.pod_name == engine_name
+                }
+            return current != expected
+
         with self.available_engines_lock:
             existing = self.available_engines.get(engine_name)
 
         if existing is None:
             return True
 
-        target_port = pd_sidecar_port or self.port
-        target_url = f"http://{engine_ip}:{target_port}"
         return (
             existing.url != target_url
             or existing.model_names != model_names
@@ -898,10 +978,109 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             or existing.workspace != workspace
             or existing.endpoint != endpoint
             or existing.routing_logic != routing_logic
-            or existing.role_group_id != role_group_id
-            or existing.prefill_count != (prefill_count or 1)
-            or existing.decode_count != (decode_count or 1)
         )
+
+    @staticmethod
+    def _pd_unit_engine_name(engine_name: str, unit: PDTopologyUnit) -> str:
+        return f"{engine_name}:{unit.role}:{unit.rank}"
+
+    @staticmethod
+    def _route_meta_for_pd_unit(unit: PDTopologyUnit) -> Dict[str, int]:
+        return {f"{unit.role}_index": unit.rank}
+
+    def _build_pd_endpoint_info(
+        self,
+        engine_name: str,
+        engine_ip: str,
+        model_names: List[str],
+        model_label: str,
+        workspace: str,
+        endpoint: str,
+        routing_logic: str,
+        role_group_id: str,
+        group_uid: Optional[str],
+        domain: Optional[str],
+        pd_sidecar_port: int,
+        model_info: Dict[str, ModelInfo],
+        sleep_status: bool,
+        unit: PDTopologyUnit,
+    ) -> tuple[str, EndpointInfo]:
+        unit_engine_name = self._pd_unit_engine_name(engine_name, unit)
+        url = f"http://{engine_ip}:{pd_sidecar_port}"
+        endpoint_info = EndpointInfo(
+            url=url,
+            model_names=model_names,
+            added_timestamp=int(time.time()),
+            Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, unit_engine_name)),
+            model_label=model_label,
+            sleep=sleep_status,
+            pod_name=engine_name,
+            namespace=self.namespace,
+            model_info=model_info,
+            workspace=workspace,
+            endpoint=endpoint,
+            routing_logic=routing_logic,
+            group_id=role_group_id,
+            group_uid=group_uid,
+            domain=domain,
+            pd_role=unit.role,
+            pd_rank=unit.rank,
+            route_meta=self._route_meta_for_pd_unit(unit),
+            role_group_id=role_group_id,
+            prefill_count=0,
+            decode_count=0,
+        )
+        return unit_engine_name, endpoint_info
+
+    @staticmethod
+    def _endpoint_signature(endpoint_info: EndpointInfo) -> tuple:
+        return (
+            endpoint_info.url,
+            tuple(endpoint_info.model_names),
+            endpoint_info.model_label,
+            endpoint_info.workspace,
+            endpoint_info.endpoint,
+            endpoint_info.routing_logic,
+            endpoint_info.group_id,
+            endpoint_info.group_uid,
+            endpoint_info.domain,
+            endpoint_info.pd_role,
+            endpoint_info.pd_rank,
+            tuple(sorted(endpoint_info.route_meta.items())),
+        )
+
+    def _build_pd_endpoint_signatures(
+        self,
+        target_url: str,
+        model_names: List[str],
+        model_label: Optional[str],
+        workspace: Optional[str],
+        endpoint: Optional[str],
+        routing_logic: Optional[str],
+        role_group_id: Optional[str],
+        group_uid: Optional[str],
+        domain: Optional[str],
+        pd_topology: Optional[PDTopology],
+    ) -> Set[tuple]:
+        if pd_topology is None:
+            return set()
+        return {
+            (
+                target_url,
+                tuple(model_names),
+                model_label,
+                workspace,
+                endpoint,
+                routing_logic,
+                role_group_id,
+                group_uid,
+                domain,
+                unit.role,
+                unit.rank,
+                tuple(sorted(self._route_meta_for_pd_unit(unit).items())),
+            )
+            for unit in pd_topology.units
+        }
 
     def _watch_engines(self):
         while self.running:
@@ -918,7 +1097,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     pod_ip = pod.status.pod_ip
 
                     if event_type == "DELETED":
-                        if pod_name in self.available_engines:
+                        if any(
+                            key == pod_name or endpoint_info.pod_name == pod_name
+                            for key, endpoint_info in self.available_engines.items()
+                        ):
                             self._delete_engine(pod_name)
                         continue
 
@@ -932,22 +1114,23 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
                     role_group_id = None
-                    prefill_count = None
-                    decode_count = None
+                    group_uid = None
+                    domain = None
                     pd_sidecar_port = None
+                    pd_topology = None
 
                     if is_pod_ready:
                         routing_logic = self._get_routing_logic(pod)
                         (
                             role_group_id,
-                            prefill_count,
-                            decode_count,
+                            group_uid,
+                            domain,
                             pd_sidecar_port,
                         ) = self._get_pd_metadata(pod, routing_logic)
+                        if routing_logic == PD_ROUTING_LOGIC:
+                            pd_topology = self._get_pd_topology(pod_ip, pd_sidecar_port)
                         if routing_logic == PD_ROUTING_LOGIC and (
-                            prefill_count is None
-                            or decode_count is None
-                            or pd_sidecar_port is None
+                            pd_sidecar_port is None or pd_topology is None
                         ):
                             is_pod_ready = False
                             model_names = []
@@ -963,6 +1146,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace = None
                         endpoint = None
                         routing_logic = None
+                        pd_topology = None
 
                     # Record pod status for debugging
                     if is_container_ready and is_pod_terminating:
@@ -981,9 +1165,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         endpoint,
                         routing_logic,
                         role_group_id,
-                        prefill_count,
-                        decode_count,
+                        group_uid,
+                        domain,
                         pd_sidecar_port,
+                        pd_topology,
                     )
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
@@ -999,9 +1184,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         endpoint: str,
         routing_logic: str,
         role_group_id: Optional[str],
-        prefill_count: Optional[int],
-        decode_count: Optional[int],
+        group_uid: Optional[str],
+        domain: Optional[str],
         pd_sidecar_port: Optional[int],
+        pd_topology: Optional[PDTopology],
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -1019,36 +1205,51 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
         with self.available_engines_lock:
             target_port = pd_sidecar_port or self.port
-            self.available_engines[engine_name] = EndpointInfo(
-                url=f"http://{engine_ip}:{target_port}",
-                model_names=model_names,
-                added_timestamp=int(time.time()),
-                Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, engine_name)),
-                model_label=model_label,
-                sleep=sleep_status,
-                pod_name=engine_name,
-                namespace=self.namespace,
-                model_info=model_info,
-                workspace=workspace,
-                endpoint=endpoint,
-                routing_logic=routing_logic,
-                role_group_id=role_group_id,
-                prefill_count=prefill_count or 1,
-                decode_count=decode_count or 1,
-            )
-
-            # Store model information in the endpoint info
-            self.available_engines[engine_name].model_info = model_info
-
-            # Get the endpoint info for callback
-            endpoint_info = self.available_engines[engine_name]
+            if routing_logic == PD_ROUTING_LOGIC and pd_topology is not None:
+                endpoint_infos = []
+                for unit in pd_topology.units:
+                    unit_engine_name, endpoint_info = self._build_pd_endpoint_info(
+                        engine_name,
+                        engine_ip,
+                        model_names,
+                        model_label,
+                        workspace,
+                        endpoint,
+                        routing_logic,
+                        role_group_id or pd_topology.group_id,
+                        group_uid,
+                        domain,
+                        target_port,
+                        model_info,
+                        sleep_status,
+                        unit,
+                    )
+                    self.available_engines[unit_engine_name] = endpoint_info
+                    endpoint_infos.append((unit_engine_name, endpoint_info))
+            else:
+                self.available_engines[engine_name] = EndpointInfo(
+                    url=f"http://{engine_ip}:{target_port}",
+                    model_names=model_names,
+                    added_timestamp=int(time.time()),
+                    Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, engine_name)),
+                    model_label=model_label,
+                    sleep=sleep_status,
+                    pod_name=engine_name,
+                    namespace=self.namespace,
+                    model_info=model_info,
+                    workspace=workspace,
+                    endpoint=endpoint,
+                    routing_logic=routing_logic,
+                )
+                endpoint_infos = [(engine_name, self.available_engines[engine_name])]
 
         # Trigger callbacks after releasing lock
-        self._trigger_callbacks(
-            ServiceDiscoveryEventType.ENGINE_ADDED,
-            engine_name,
-            endpoint_info,
-        )
+        for endpoint_name, endpoint_info in endpoint_infos:
+            self._trigger_callbacks(
+                ServiceDiscoveryEventType.ENGINE_ADDED,
+                endpoint_name,
+                endpoint_info,
+            )
 
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -1066,16 +1267,21 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
     def _delete_engine(self, engine_name: str):
         logger.info(f"Serving engine {engine_name} is deleted")
         with self.available_engines_lock:
-            # Get endpoint info before deletion for callback
-            endpoint_info = self.available_engines.get(engine_name)
-            del self.available_engines[engine_name]
+            delete_items = [
+                (key, endpoint_info)
+                for key, endpoint_info in self.available_engines.items()
+                if key == engine_name or endpoint_info.pod_name == engine_name
+            ]
+            for key, _ in delete_items:
+                del self.available_engines[key]
 
         # Trigger callbacks after releasing lock
-        self._trigger_callbacks(
-            ServiceDiscoveryEventType.ENGINE_DELETED,
-            engine_name,
-            endpoint_info,
-        )
+        for endpoint_name, endpoint_info in delete_items:
+            self._trigger_callbacks(
+                ServiceDiscoveryEventType.ENGINE_DELETED,
+                endpoint_name,
+                endpoint_info,
+            )
 
     def _on_engine_update(
         self,
@@ -1089,9 +1295,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         endpoint: Optional[str],
         routing_logic: Optional[str],
         role_group_id: Optional[str],
-        prefill_count: Optional[int],
-        decode_count: Optional[int],
+        group_uid: Optional[str],
+        domain: Optional[str],
         pd_sidecar_port: Optional[int],
+        pd_topology: Optional[PDTopology],
     ) -> None:
         """
         Handle engine update events from Kubernetes watcher.
@@ -1117,13 +1324,17 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 endpoint,
                 routing_logic,
                 role_group_id,
-                prefill_count,
-                decode_count,
+                group_uid,
+                domain,
                 pd_sidecar_port,
+                pd_topology,
             )
 
         elif event == "DELETED":
-            if engine_name not in self.available_engines:
+            if not any(
+                key == engine_name or endpoint_info.pod_name == engine_name
+                for key, endpoint_info in self.available_engines.items()
+            ):
                 return
 
             self._delete_engine(engine_name)
@@ -1133,7 +1344,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 return
 
             # Check if engine availability status changed
-            was_available = engine_name in self.available_engines
+            was_available = any(
+                key == engine_name or endpoint_info.pod_name == engine_name
+                for key, endpoint_info in self.available_engines.items()
+            )
             is_now_available = is_pod_ready and model_names
 
             if is_now_available and not was_available:
@@ -1147,9 +1361,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     endpoint,
                     routing_logic,
                     role_group_id,
-                    prefill_count,
-                    decode_count,
+                    group_uid,
+                    domain,
                     pd_sidecar_port,
+                    pd_topology,
                 )
             elif is_now_available and was_available:
                 if self._engine_needs_refresh(
@@ -1161,9 +1376,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     endpoint,
                     routing_logic,
                     role_group_id,
-                    prefill_count,
-                    decode_count,
+                    group_uid,
+                    domain,
                     pd_sidecar_port,
+                    pd_topology,
                 ):
                     self._delete_engine(engine_name)
                     self._add_engine(
@@ -1175,9 +1391,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         endpoint,
                         routing_logic,
                         role_group_id,
-                        prefill_count,
-                        decode_count,
+                        group_uid,
+                        domain,
                         pd_sidecar_port,
+                        pd_topology,
                     )
             elif not is_now_available and was_available:
                 # Engine became unavailable: trigger ENGINE_DELETED
