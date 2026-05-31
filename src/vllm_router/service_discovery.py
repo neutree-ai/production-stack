@@ -893,6 +893,22 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
         return domain, pd_sidecar_port
 
+    def _get_pd_metadata_for_engine(
+        self, engine_name: str, routing_logic: Optional[str]
+    ) -> tuple[Optional[str], Optional[int]]:
+        if routing_logic != PD_ROUTING_LOGIC:
+            return None, None
+
+        try:
+            pod = self.k8s_api.read_namespaced_pod(
+                name=engine_name, namespace=self.namespace
+            )
+        except client.rest.ApiException as e:
+            logger.warning("Failed to read P/D pod metadata for %s: %s", engine_name, e)
+            return None, None
+
+        return self._get_pd_metadata(pod, routing_logic)
+
     def _get_pd_topology(
         self, pod_ip: str, pd_sidecar_port: Optional[int]
     ) -> Optional[PDTopology]:
@@ -913,14 +929,14 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
-        domain: Optional[str],
-        pd_sidecar_port: Optional[int],
-        pd_topology: Optional[PDTopology],
     ) -> bool:
-        target_port = pd_sidecar_port or self.port
-        target_url = f"http://{engine_ip}:{target_port}"
-
         if routing_logic == PD_ROUTING_LOGIC:
+            domain, pd_sidecar_port = self._get_pd_metadata_for_engine(
+                engine_name, routing_logic
+            )
+            pd_topology = self._get_pd_topology(engine_ip, pd_sidecar_port)
+            target_port = pd_sidecar_port or self.port
+            target_url = f"http://{engine_ip}:{target_port}"
             expected = self._build_pd_endpoint_signatures(
                 target_url,
                 model_names,
@@ -939,6 +955,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 }
             return current != expected
 
+        target_url = f"http://{engine_ip}:{self.port}"
         with self.available_engines_lock:
             existing = self.available_engines.get(engine_name)
 
@@ -1051,11 +1068,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     pod_ip = pod.status.pod_ip
 
                     if event_type == "DELETED":
-                        if any(
-                            key == pod_name or endpoint_info.pod_name == pod_name
-                            for key, endpoint_info in self.available_engines.items()
-                        ):
-                            self._delete_engine(pod_name)
+                        self._delete_engine(pod_name)
                         continue
 
                     # Check if pod is terminating
@@ -1067,35 +1080,18 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     # Pod is ready if container is ready and pod is not terminating
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
-                    domain = None
-                    pd_sidecar_port = None
-                    pd_topology = None
-
                     if is_pod_ready:
-                        routing_logic = self._get_routing_logic(pod)
-                        domain, pd_sidecar_port = self._get_pd_metadata(
-                            pod, routing_logic
-                        )
-                        if routing_logic == PD_ROUTING_LOGIC:
-                            pd_topology = self._get_pd_topology(pod_ip, pd_sidecar_port)
-                        if routing_logic == PD_ROUTING_LOGIC and (
-                            pd_sidecar_port is None or pd_topology is None
-                        ):
-                            is_pod_ready = False
-                            model_names = []
-                        else:
-                            model_names = self._get_model_names(pod_ip)
-                    if is_pod_ready:
+                        model_names = self._get_model_names(pod_ip)
                         model_label = self._get_model_label(pod)
                         workspace = self._get_workspace(pod)
                         endpoint = self._get_endpoint(pod)
+                        routing_logic = self._get_routing_logic(pod)
                     else:
                         model_names = []
                         model_label = None
                         workspace = None
                         endpoint = None
                         routing_logic = None
-                        pd_topology = None
 
                     # Record pod status for debugging
                     if is_container_ready and is_pod_terminating:
@@ -1113,9 +1109,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
-                        domain,
-                        pd_sidecar_port,
-                        pd_topology,
                     )
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
@@ -1130,9 +1123,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: str,
         endpoint: str,
         routing_logic: str,
-        domain: Optional[str],
-        pd_sidecar_port: Optional[int],
-        pd_topology: Optional[PDTopology],
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -1147,6 +1137,19 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             sleep_status = self._get_engine_sleep_status(engine_ip)
         else:
             sleep_status = False
+
+        domain, pd_sidecar_port = self._get_pd_metadata_for_engine(
+            engine_name, routing_logic
+        )
+        pd_topology = None
+        if routing_logic == PD_ROUTING_LOGIC:
+            pd_topology = self._get_pd_topology(engine_ip, pd_sidecar_port)
+            if pd_sidecar_port is None or pd_topology is None:
+                logger.warning(
+                    "P/D pod %s has no schedulable topology; skipping engine add",
+                    engine_name,
+                )
+                return
 
         with self.available_engines_lock:
             target_port = pd_sidecar_port or self.port
@@ -1208,15 +1211,18 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             self.known_models.update(model_names)
 
     def _delete_engine(self, engine_name: str):
-        logger.info(f"Serving engine {engine_name} is deleted")
         with self.available_engines_lock:
             delete_items = [
                 (key, endpoint_info)
                 for key, endpoint_info in self.available_engines.items()
                 if key == engine_name or endpoint_info.pod_name == engine_name
             ]
+            if not delete_items:
+                return
             for key, _ in delete_items:
                 del self.available_engines[key]
+
+        logger.info(f"Serving engine {engine_name} is deleted")
 
         # Trigger callbacks after releasing lock
         for endpoint_name, endpoint_info in delete_items:
@@ -1237,9 +1243,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
-        domain: Optional[str],
-        pd_sidecar_port: Optional[int],
-        pd_topology: Optional[PDTopology],
     ) -> None:
         """
         Handle engine update events from Kubernetes watcher.
@@ -1264,9 +1267,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace,
                 endpoint,
                 routing_logic,
-                domain,
-                pd_sidecar_port,
-                pd_topology,
             )
 
         elif event == "DELETED":
@@ -1299,9 +1299,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     workspace,
                     endpoint,
                     routing_logic,
-                    domain,
-                    pd_sidecar_port,
-                    pd_topology,
                 )
             elif is_now_available and was_available:
                 if self._engine_needs_refresh(
@@ -1312,9 +1309,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     workspace,
                     endpoint,
                     routing_logic,
-                    domain,
-                    pd_sidecar_port,
-                    pd_topology,
                 ):
                     self._delete_engine(engine_name)
                     self._add_engine(
@@ -1325,9 +1319,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
-                        domain,
-                        pd_sidecar_port,
-                        pd_topology,
                     )
             elif not is_now_available and was_available:
                 # Engine became unavailable: trigger ENGINE_DELETED

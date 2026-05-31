@@ -74,6 +74,18 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
     discovery.initialize_client_sessions = lambda: None
     discovery._get_model_info = lambda engine_ip: {}
     discovery._check_engine_sleep_mode = lambda engine_name: False
+    discovery._get_pd_metadata_for_engine = lambda engine_name, routing_logic: (
+        "endpoint-collocated-0",
+        9000,
+    )
+    discovery._get_pd_topology = lambda engine_ip, pd_sidecar_port: SimpleNamespace(
+        group_id="endpoint-collocated-0",
+        units=[
+            SimpleNamespace(role="prefill", rank=0),
+            SimpleNamespace(role="prefill", rank=1),
+            SimpleNamespace(role="decode", rank=0),
+        ],
+    )
 
     discovery._add_engine(
         engine_name="endpoint-collocated-0",
@@ -83,16 +95,6 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
         workspace="ws",
         endpoint="ep",
         routing_logic="pd",
-        domain="endpoint-collocated-0",
-        pd_sidecar_port=9000,
-        pd_topology=SimpleNamespace(
-            group_id="endpoint-collocated-0",
-            units=[
-                SimpleNamespace(role="prefill", rank=0),
-                SimpleNamespace(role="prefill", rank=1),
-                SimpleNamespace(role="decode", rank=0),
-            ],
-        ),
     )
 
     endpoints = discovery.get_endpoint_info()
@@ -173,6 +175,18 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
     }
     discovery.available_engines_lock = threading.Lock()
     calls = []
+    topology = SimpleNamespace(
+        group_id="rg-0",
+        units=[
+            SimpleNamespace(role="prefill", rank=0),
+            SimpleNamespace(role="decode", rank=0),
+        ],
+    )
+    discovery._get_pd_metadata_for_engine = lambda engine_name, routing_logic: (
+        "pod-0",
+        9000,
+    )
+    discovery._get_pd_topology = lambda engine_ip, pd_sidecar_port: topology
 
     def delete_engine(engine_name):
         calls.append(("delete", engine_name))
@@ -188,19 +202,8 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
         workspace,
         endpoint,
         routing_logic,
-        domain,
-        pd_sidecar_port,
-        pd_topology,
     ):
-        calls.append(
-            (
-                "add",
-                engine_name,
-                domain,
-                pd_sidecar_port,
-                tuple((unit.role, unit.rank) for unit in pd_topology.units),
-            )
-        )
+        calls.append(("add", engine_name))
 
     discovery._delete_engine = delete_engine
     discovery._add_engine = add_engine
@@ -215,24 +218,9 @@ def test_k8s_service_discovery_refreshes_ready_pod_when_group_topology_changes()
         workspace="ws",
         endpoint="ep",
         routing_logic="pd",
-        domain="pod-0",
-        pd_sidecar_port=9000,
-        pd_topology=SimpleNamespace(
-            group_id="rg-0",
-            units=[
-                SimpleNamespace(role="prefill", rank=0),
-                SimpleNamespace(role="decode", rank=0),
-            ],
-        ),
     )
 
     assert calls == [
         ("delete", "pod-0"),
-        (
-            "add",
-            "pod-0",
-            "pod-0",
-            9000,
-            (("prefill", 0), ("decode", 0)),
-        ),
+        ("add", "pod-0"),
     ]
