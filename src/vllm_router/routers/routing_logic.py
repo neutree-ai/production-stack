@@ -898,30 +898,60 @@ class PDRouter(RoutingInterface):
             return None
 
         candidate_units = list(units_by_id.values())
-        _, initial_idx = self._search(sorted_hashes, payload_hash)
-        checked_unit_ids: Set[str] = set()
-        default_unit = None
-        current_idx = initial_idx
 
+        # P/D units in one group can share the same sidecar URL; use unit_id as
+        # the CHWBL replica identity.
+        unit_hash, unit_idx = self._search(sorted_hashes, payload_hash)
+        initial_unit_id = hash_to_unit_id[unit_hash]
+
+        logger.debug(
+            "PDRouter CHWBL: Initial lookup for payload hash %s -> %s",
+            payload_hash,
+            initial_unit_id,
+        )
+
+        checked_unit_ids: Set[str] = set()
+        default_unit_id = None
+
+        current_idx = unit_idx
         while len(checked_unit_ids) < len(units_by_id):
             current_hash = sorted_hashes[current_idx]
             current_unit_id = hash_to_unit_id[current_hash]
-            current_unit = units_by_id[current_unit_id]
 
             if current_unit_id in checked_unit_ids:
                 current_idx = (current_idx + 1) % len(sorted_hashes)
                 continue
 
             checked_unit_ids.add(current_unit_id)
-            if default_unit is None:
-                default_unit = current_unit
+            if default_unit_id is None:
+                default_unit_id = current_unit_id
 
+            current_unit = units_by_id[current_unit_id]
             if self._check_load(state, current_unit, candidate_units):
+                logger.info(
+                    "PDRouter CHWBL: Selected unit %s after checking %s units "
+                    "(payload hash %s)",
+                    current_unit_id,
+                    len(checked_unit_ids),
+                    payload_hash,
+                )
                 return current_unit
 
             current_idx = (current_idx + 1) % len(sorted_hashes)
 
-        return default_unit
+        if default_unit_id is not None:
+            logger.info(
+                "PDRouter CHWBL: Using default unit %s as no unit met load "
+                "factor (payload hash %s)",
+                default_unit_id,
+                payload_hash,
+            )
+            return units_by_id[default_unit_id]
+
+        logger.error(
+            "PDRouter CHWBL: No units available for payload hash %s", payload_hash
+        )
+        return None
 
     def _select_decode_unit(
         self, state: PDRouterState, payload_hash: int
