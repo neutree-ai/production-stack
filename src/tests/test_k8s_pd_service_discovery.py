@@ -16,7 +16,11 @@ def make_pod(labels=None, annotations=None):
             uid="pod-uid-0",
             labels=labels or {},
             annotations=annotations or {},
-        )
+        ),
+        status=SimpleNamespace(
+            pod_ip="10.0.0.1",
+            container_statuses=[],
+        ),
     )
 
 
@@ -72,7 +76,10 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
     discovery.app = SimpleNamespace(state=SimpleNamespace(event_loop=None))
     discovery._trigger_callbacks = lambda *args: None
     discovery.initialize_client_sessions = lambda: None
-    discovery._get_model_info = lambda engine_ip: {}
+    model_info_ports = []
+    discovery._get_model_info = (
+        lambda engine_ip, port=None: model_info_ports.append(port) or {}
+    )
     discovery._check_engine_sleep_mode = lambda engine_name: False
     discovery._get_pd_metadata_for_engine = lambda engine_name, routing_logic: (
         "endpoint-collocated-0",
@@ -113,6 +120,46 @@ def test_k8s_service_discovery_expands_group_topology_to_rank_endpoints():
         if endpoint.role == "decode"
     } == {("decode", 0)}
     assert {endpoint.domain for endpoint in endpoints} == {"endpoint-collocated-0"}
+    assert model_info_ports == [9000]
+
+
+def test_k8s_service_discovery_gets_pd_model_names_from_sidecar_port():
+    discovery = object.__new__(K8sPodIPServiceDiscovery)
+    discovery.running = True
+    discovery.namespace = "default"
+    discovery.label_selector = "release=router"
+    discovery.watcher_timeout_seconds = 0
+    discovery.port = 8000
+    calls = []
+
+    pod = make_pod(
+        annotations={
+            "neutree.io/pd-deployment-type": "group",
+            "neutree.io/pd-sidecar-port": "9000",
+        }
+    )
+
+    class Watcher:
+        def stream(self, *args, **kwargs):
+            discovery.running = False
+            return [{"type": "ADDED", "object": pod}]
+
+    discovery.k8s_watcher = Watcher()
+    discovery.k8s_api = SimpleNamespace(list_namespaced_pod=lambda *args, **kwargs: [])
+    discovery._is_pod_terminating = lambda pod: False
+    discovery._check_pod_ready = lambda container_statuses: True
+    discovery._get_model_names = lambda pod_ip, port=None: calls.append(
+        ("models", pod_ip, port)
+    ) or ["llama"]
+    discovery._get_model_label = lambda pod: "llama"
+    discovery._get_workspace = lambda pod: "ws"
+    discovery._get_endpoint = lambda pod: "ep"
+    discovery._get_routing_logic = lambda pod: "pd"
+    discovery._on_engine_update = lambda *args: calls.append(("update", args))
+
+    discovery._watch_engines()
+
+    assert ("models", "10.0.0.1", 9000) in calls
 
 
 def test_k8s_service_discovery_deletes_all_expanded_group_endpoints():

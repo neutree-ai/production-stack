@@ -679,18 +679,20 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         except client.rest.ApiException as e:
             logger.error(f"Error removing sleeping label: {e}")
 
-    def _get_model_names(self, pod_ip) -> List[str]:
+    def _get_model_names(self, pod_ip, port: Optional[int] = None) -> List[str]:
         """
         Get the model names of the serving engine pod by querying the pod's
         '/v1/models' endpoint.
 
         Args:
             pod_ip: the IP address of the pod
+            port: the HTTP port to query; defaults to the serving engine port
 
         Returns:
             List of model names available on the serving engine, including both base models and adapters
         """
-        url = f"http://{pod_ip}:{self.port}/v1/models"
+        target_port = port or self.port
+        url = f"http://{pod_ip}:{target_port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -714,17 +716,21 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             logger.error(f"Failed to get model names from {url}: {e}")
             return []
 
-    def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
+    def _get_model_info(
+        self, pod_ip, port: Optional[int] = None
+    ) -> Dict[str, ModelInfo]:
         """
         Get detailed model information from the serving engine pod.
 
         Args:
             pod_ip: the IP address of the pod
+            port: the HTTP port to query; defaults to the serving engine port
 
         Returns:
             Dictionary mapping model IDs to their ModelInfo objects, including parent-child relationships
         """
-        url = f"http://{pod_ip}:{self.port}/v1/models"
+        target_port = port or self.port
+        url = f"http://{pod_ip}:{target_port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -988,11 +994,21 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
                     if is_pod_ready:
-                        model_names = self._get_model_names(pod_ip)
                         model_label = self._get_model_label(pod)
                         workspace = self._get_workspace(pod)
                         endpoint = self._get_endpoint(pod)
                         routing_logic = self._get_routing_logic(pod)
+                        if routing_logic == PD_ROUTING_LOGIC:
+                            _, pd_sidecar_port = self._get_pd_metadata(
+                                pod, routing_logic
+                            )
+                            model_names = (
+                                self._get_model_names(pod_ip, pd_sidecar_port)
+                                if pd_sidecar_port is not None
+                                else []
+                            )
+                        else:
+                            model_names = self._get_model_names(pod_ip)
                     else:
                         model_names = []
                         model_label = None
@@ -1036,19 +1052,11 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             f"{engine_ip}, running models: {model_names}"
         )
 
-        # Get detailed model information
-        model_info = self._get_model_info(engine_ip)
-
-        # Check if engine is enabled with sleep mode and set engine sleep status
-        if self._check_engine_sleep_mode(engine_name):
-            sleep_status = self._get_engine_sleep_status(engine_ip)
-        else:
-            sleep_status = False
-
         domain, pd_sidecar_port = self._get_pd_metadata_for_engine(
             engine_name, routing_logic
         )
         pd_topology = None
+        target_port = self.port
         if routing_logic == PD_ROUTING_LOGIC:
             pd_topology = self._get_pd_topology(engine_ip, pd_sidecar_port)
             if pd_sidecar_port is None or pd_topology is None:
@@ -1057,9 +1065,18 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     engine_name,
                 )
                 return
+            target_port = pd_sidecar_port
+
+        # Get detailed model information
+        model_info = self._get_model_info(engine_ip, target_port)
+
+        # Check if engine is enabled with sleep mode and set engine sleep status
+        if self._check_engine_sleep_mode(engine_name):
+            sleep_status = self._get_engine_sleep_status(engine_ip)
+        else:
+            sleep_status = False
 
         with self.available_engines_lock:
-            target_port = pd_sidecar_port or self.port
             if routing_logic == PD_ROUTING_LOGIC and pd_topology is not None:
                 endpoint_infos = []
                 for unit in pd_topology.units:
