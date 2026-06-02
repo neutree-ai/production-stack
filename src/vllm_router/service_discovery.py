@@ -32,6 +32,7 @@ from vllm_router.log import init_logger
 logger = init_logger(__name__)
 
 _global_service_discovery: "Optional[ServiceDiscovery]" = None
+PD_ROUTING_LOGIC = "pd"
 
 
 class ServiceDiscoveryType(enum.Enum):
@@ -89,6 +90,65 @@ class ModelInfo:
         }
 
 
+@dataclass(frozen=True)
+class PDTopologyUnit:
+    """Schedulable P/D unit returned by a topology source."""
+
+    role: str
+    rank: int
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PDTopologyUnit":
+        return cls(role=data.get("role"), rank=int(data.get("rank")))
+
+
+@dataclass(frozen=True)
+class PDTopology:
+    """Minimal P/D topology contract consumed by discovery."""
+
+    group_id: str
+    units: List[PDTopologyUnit]
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "PDTopology":
+        units = [PDTopologyUnit.from_dict(unit) for unit in data.get("units", [])]
+        return cls(group_id=data.get("group_id"), units=units)
+
+
+class TopologyResolver(abc.ABC):
+    """Abstract topology source for direct/group discovery targets."""
+
+    @abc.abstractmethod
+    def resolve(self, target: str) -> Optional[PDTopology]:
+        raise NotImplementedError
+
+
+class SidecarHTTPTopologyResolver(TopologyResolver):
+    """Resolve P/D group topology from a sidecar HTTP endpoint."""
+
+    def __init__(self, timeout_seconds: int):
+        self.timeout_seconds = timeout_seconds
+
+    def resolve(self, target: str) -> Optional[PDTopology]:
+        try:
+            response = requests.get(target, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            topology = PDTopology.from_dict(response.json())
+        except Exception as e:
+            logger.warning("Failed to resolve P/D topology from %s: %s", target, e)
+            return None
+
+        valid_units = [
+            unit
+            for unit in topology.units
+            if unit.role in {"prefill", "decode"} and unit.rank >= 0
+        ]
+        if not topology.group_id or not valid_units:
+            logger.warning("Invalid P/D topology from %s: %s", target, topology)
+            return None
+        return PDTopology(group_id=topology.group_id, units=valid_units)
+
+
 @dataclass
 class EndpointInfo:
     # Endpoint's url
@@ -130,8 +190,14 @@ class EndpointInfo:
     # Routing logic
     routing_logic: Optional[str] = None
 
+    # P/D rank metadata. Discovery expands group targets into one EndpointInfo
+    # per schedulable P/D unit before the router sees them.
+    domain: Optional[str] = None
+    role: Optional[str] = None
+    rank: Optional[int] = None
+
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, domain={self.domain}, role={self.role}, rank={self.rank})"
 
     def get_base_models(self) -> List[str]:
         """
@@ -443,6 +509,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         self.label_selector = label_selector
         self.watcher_timeout_seconds = watcher_timeout_seconds
         self.health_check_timeout_seconds = health_check_timeout_seconds
+        self.topology_resolver = SidecarHTTPTopologyResolver(
+            timeout_seconds=health_check_timeout_seconds
+        )
         self.event_callbacks = event_callbacks or []
 
         # Init kubernetes watcher
@@ -610,18 +679,20 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         except client.rest.ApiException as e:
             logger.error(f"Error removing sleeping label: {e}")
 
-    def _get_model_names(self, pod_ip) -> List[str]:
+    def _get_model_names(self, pod_ip, port: Optional[int] = None) -> List[str]:
         """
         Get the model names of the serving engine pod by querying the pod's
         '/v1/models' endpoint.
 
         Args:
             pod_ip: the IP address of the pod
+            port: the HTTP port to query; defaults to the serving engine port
 
         Returns:
             List of model names available on the serving engine, including both base models and adapters
         """
-        url = f"http://{pod_ip}:{self.port}/v1/models"
+        target_port = port or self.port
+        url = f"http://{pod_ip}:{target_port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -645,17 +716,21 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             logger.error(f"Failed to get model names from {url}: {e}")
             return []
 
-    def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
+    def _get_model_info(
+        self, pod_ip, port: Optional[int] = None
+    ) -> Dict[str, ModelInfo]:
         """
         Get detailed model information from the serving engine pod.
 
         Args:
             pod_ip: the IP address of the pod
+            port: the HTTP port to query; defaults to the serving engine port
 
         Returns:
             Dictionary mapping model IDs to their ModelInfo objects, including parent-child relationships
         """
-        url = f"http://{pod_ip}:{self.port}/v1/models"
+        target_port = port or self.port
+        url = f"http://{pod_ip}:{target_port}/v1/models"
         try:
             headers = None
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
@@ -733,6 +808,164 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return pod.metadata.labels.get("routing_logic")
 
+    @staticmethod
+    def _get_metadata_value(pod, keys: List[str]) -> Optional[str]:
+        labels = pod.metadata.labels or {}
+        annotations = pod.metadata.annotations or {}
+        for key in keys:
+            if key in labels:
+                return labels[key]
+            if key in annotations:
+                return annotations[key]
+        return None
+
+    @staticmethod
+    def _parse_nonnegative_int(value: Optional[str], default: int) -> int:
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid P/D metadata integer %s, using %s", value, default)
+            return default
+        if parsed < 0:
+            logger.warning("Negative P/D metadata integer %s, using %s", value, default)
+            return default
+        return parsed
+
+    @staticmethod
+    def _parse_positive_int(value: Optional[str], field_name: str) -> Optional[int]:
+        if value is None:
+            logger.warning("Missing required P/D metadata field %s", field_name)
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid P/D metadata field %s=%s", field_name, value)
+            return None
+        if parsed <= 0:
+            logger.warning(
+                "P/D metadata field %s must be positive: %s", field_name, value
+            )
+            return None
+        return parsed
+
+    def _get_pd_domain(self, pod) -> str:
+        return pod.metadata.name or getattr(pod.metadata, "uid", None)
+
+    def _get_pd_deployment_type(self, pod) -> Optional[str]:
+        return self._get_metadata_value(
+            pod,
+            [
+                "neutree.io/pd-deployment-type",
+                "neutree.ai/pd-deployment-type",
+                "pd_deployment_type",
+                "pd-deployment-type",
+            ],
+        )
+
+    def _get_pd_sidecar_port(self, pod) -> Optional[int]:
+        """
+        Get the sidecar port override for a collocated P/D Pod.
+        """
+        value = self._get_metadata_value(
+            pod,
+            [
+                "neutree.io/pd-sidecar-port",
+                "neutree.ai/pd-sidecar-port",
+                "pd_sidecar_port",
+                "pd-sidecar-port",
+            ],
+        )
+        if value is None:
+            logger.warning("Missing required P/D metadata field pd_sidecar_port")
+            return None
+        return self._parse_positive_int(value, "pd_sidecar_port")
+
+    def _get_pd_metadata(
+        self, pod, routing_logic: Optional[str]
+    ) -> tuple[Optional[str], Optional[int]]:
+        if routing_logic != PD_ROUTING_LOGIC:
+            return None, None
+
+        domain = self._get_pd_domain(pod)
+        pd_sidecar_port = self._get_pd_sidecar_port(pod)
+        if self._get_pd_deployment_type(pod) != "group" or pd_sidecar_port is None:
+            logger.warning(
+                "P/D pod %s is missing valid group routing metadata; marking unavailable",
+                pod.metadata.name,
+            )
+            return domain, None
+
+        return domain, pd_sidecar_port
+
+    def _get_pd_metadata_for_engine(
+        self, engine_name: str, routing_logic: Optional[str]
+    ) -> tuple[Optional[str], Optional[int]]:
+        if routing_logic != PD_ROUTING_LOGIC:
+            return None, None
+
+        try:
+            pod = self.k8s_api.read_namespaced_pod(
+                name=engine_name, namespace=self.namespace
+            )
+        except client.rest.ApiException as e:
+            logger.warning("Failed to read P/D pod metadata for %s: %s", engine_name, e)
+            return None, None
+
+        return self._get_pd_metadata(pod, routing_logic)
+
+    def _get_pd_topology(
+        self, pod_ip: str, pd_sidecar_port: Optional[int]
+    ) -> Optional[PDTopology]:
+        if pd_sidecar_port is None:
+            return None
+        topology_url = f"http://{pod_ip}:{pd_sidecar_port}/v1/pd/topology"
+        resolver = getattr(self, "topology_resolver", None)
+        if resolver is None:
+            resolver = SidecarHTTPTopologyResolver(self.health_check_timeout_seconds)
+        return resolver.resolve(topology_url)
+
+    @staticmethod
+    def _pd_unit_engine_name(engine_name: str, unit: PDTopologyUnit) -> str:
+        return f"{engine_name}:{unit.role}:{unit.rank}"
+
+    def _build_pd_endpoint_info(
+        self,
+        engine_name: str,
+        engine_ip: str,
+        model_names: List[str],
+        model_label: str,
+        workspace: str,
+        endpoint: str,
+        routing_logic: str,
+        domain: Optional[str],
+        pd_sidecar_port: int,
+        model_info: Dict[str, ModelInfo],
+        sleep_status: bool,
+        unit: PDTopologyUnit,
+    ) -> tuple[str, EndpointInfo]:
+        unit_engine_name = self._pd_unit_engine_name(engine_name, unit)
+        url = f"http://{engine_ip}:{pd_sidecar_port}"
+        endpoint_info = EndpointInfo(
+            url=url,
+            model_names=model_names,
+            added_timestamp=int(time.time()),
+            Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, unit_engine_name)),
+            model_label=model_label,
+            sleep=sleep_status,
+            pod_name=engine_name,
+            namespace=self.namespace,
+            model_info=model_info,
+            workspace=workspace,
+            endpoint=endpoint,
+            routing_logic=routing_logic,
+            domain=domain,
+            role=unit.role,
+            rank=unit.rank,
+        )
+        return unit_engine_name, endpoint_info
+
     def _watch_engines(self):
         while self.running:
             try:
@@ -748,8 +981,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     pod_ip = pod.status.pod_ip
 
                     if event_type == "DELETED":
-                        if pod_name in self.available_engines:
-                            self._delete_engine(pod_name)
+                        self._delete_engine(pod_name)
                         continue
 
                     # Check if pod is terminating
@@ -762,11 +994,21 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
                     if is_pod_ready:
-                        model_names = self._get_model_names(pod_ip)
                         model_label = self._get_model_label(pod)
                         workspace = self._get_workspace(pod)
                         endpoint = self._get_endpoint(pod)
                         routing_logic = self._get_routing_logic(pod)
+                        if routing_logic == PD_ROUTING_LOGIC:
+                            _, pd_sidecar_port = self._get_pd_metadata(
+                                pod, routing_logic
+                            )
+                            model_names = (
+                                self._get_model_names(pod_ip, pd_sidecar_port)
+                                if pd_sidecar_port is not None
+                                else []
+                            )
+                        else:
+                            model_names = self._get_model_names(pod_ip)
                     else:
                         model_names = []
                         model_label = None
@@ -810,8 +1052,23 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             f"{engine_ip}, running models: {model_names}"
         )
 
+        domain, pd_sidecar_port = self._get_pd_metadata_for_engine(
+            engine_name, routing_logic
+        )
+        pd_topology = None
+        target_port = self.port
+        if routing_logic == PD_ROUTING_LOGIC:
+            pd_topology = self._get_pd_topology(engine_ip, pd_sidecar_port)
+            if pd_sidecar_port is None or pd_topology is None:
+                logger.warning(
+                    "P/D pod %s has no schedulable topology; skipping engine add",
+                    engine_name,
+                )
+                return
+            target_port = pd_sidecar_port
+
         # Get detailed model information
-        model_info = self._get_model_info(engine_ip)
+        model_info = self._get_model_info(engine_ip, target_port)
 
         # Check if engine is enabled with sleep mode and set engine sleep status
         if self._check_engine_sleep_mode(engine_name):
@@ -820,33 +1077,49 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             sleep_status = False
 
         with self.available_engines_lock:
-            self.available_engines[engine_name] = EndpointInfo(
-                url=f"http://{engine_ip}:{self.port}",
-                model_names=model_names,
-                added_timestamp=int(time.time()),
-                Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, engine_name)),
-                model_label=model_label,
-                sleep=sleep_status,
-                pod_name=engine_name,
-                namespace=self.namespace,
-                model_info=model_info,
-                workspace=workspace,
-                endpoint=endpoint,
-                routing_logic=routing_logic,
-            )
-
-            # Store model information in the endpoint info
-            self.available_engines[engine_name].model_info = model_info
-
-            # Get the endpoint info for callback
-            endpoint_info = self.available_engines[engine_name]
+            if routing_logic == PD_ROUTING_LOGIC and pd_topology is not None:
+                endpoint_infos = []
+                for unit in pd_topology.units:
+                    unit_engine_name, endpoint_info = self._build_pd_endpoint_info(
+                        engine_name,
+                        engine_ip,
+                        model_names,
+                        model_label,
+                        workspace,
+                        endpoint,
+                        routing_logic,
+                        domain,
+                        target_port,
+                        model_info,
+                        sleep_status,
+                        unit,
+                    )
+                    self.available_engines[unit_engine_name] = endpoint_info
+                    endpoint_infos.append((unit_engine_name, endpoint_info))
+            else:
+                self.available_engines[engine_name] = EndpointInfo(
+                    url=f"http://{engine_ip}:{target_port}",
+                    model_names=model_names,
+                    added_timestamp=int(time.time()),
+                    Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, engine_name)),
+                    model_label=model_label,
+                    sleep=sleep_status,
+                    pod_name=engine_name,
+                    namespace=self.namespace,
+                    model_info=model_info,
+                    workspace=workspace,
+                    endpoint=endpoint,
+                    routing_logic=routing_logic,
+                )
+                endpoint_infos = [(engine_name, self.available_engines[engine_name])]
 
         # Trigger callbacks after releasing lock
-        self._trigger_callbacks(
-            ServiceDiscoveryEventType.ENGINE_ADDED,
-            engine_name,
-            endpoint_info,
-        )
+        for endpoint_name, endpoint_info in endpoint_infos:
+            self._trigger_callbacks(
+                ServiceDiscoveryEventType.ENGINE_ADDED,
+                endpoint_name,
+                endpoint_info,
+            )
 
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -862,18 +1135,26 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             self.known_models.update(model_names)
 
     def _delete_engine(self, engine_name: str):
-        logger.info(f"Serving engine {engine_name} is deleted")
         with self.available_engines_lock:
-            # Get endpoint info before deletion for callback
-            endpoint_info = self.available_engines.get(engine_name)
-            del self.available_engines[engine_name]
+            delete_items = [
+                (key, endpoint_info)
+                for key, endpoint_info in self.available_engines.items()
+                if key == engine_name or endpoint_info.pod_name == engine_name
+            ]
+            if not delete_items:
+                return
+            for key, _ in delete_items:
+                del self.available_engines[key]
+
+        logger.info(f"Serving engine {engine_name} is deleted")
 
         # Trigger callbacks after releasing lock
-        self._trigger_callbacks(
-            ServiceDiscoveryEventType.ENGINE_DELETED,
-            engine_name,
-            endpoint_info,
-        )
+        for endpoint_name, endpoint_info in delete_items:
+            self._trigger_callbacks(
+                ServiceDiscoveryEventType.ENGINE_DELETED,
+                endpoint_name,
+                endpoint_info,
+            )
 
     def _on_engine_update(
         self,
@@ -913,7 +1194,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             )
 
         elif event == "DELETED":
-            if engine_name not in self.available_engines:
+            if not any(
+                key == engine_name or endpoint_info.pod_name == engine_name
+                for key, endpoint_info in self.available_engines.items()
+            ):
                 return
 
             self._delete_engine(engine_name)
@@ -923,7 +1207,10 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 return
 
             # Check if engine availability status changed
-            was_available = engine_name in self.available_engines
+            was_available = any(
+                key == engine_name or endpoint_info.pod_name == engine_name
+                for key, endpoint_info in self.available_engines.items()
+            )
             is_now_available = is_pod_ready and model_names
 
             if is_now_available and not was_available:
