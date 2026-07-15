@@ -23,6 +23,7 @@ from vllm_router.services.metrics_service import (
     avg_decoding_length,
     avg_itl,
     avg_latency,
+    clear_endpoint_metrics,
     current_qps,
     gpu_prefix_cache_hit_rate,
     gpu_prefix_cache_hits_total,
@@ -87,7 +88,7 @@ async def metrics():
 
     endpoints = get_service_discovery().get_endpoint_info()
     stats = get_request_stats_monitor().get_request_stats(time.time())
-    healthy_pods_total.clear()
+    clear_endpoint_metrics()
     for ep in endpoints:
         # set gpu cache metrics
         if get_engine_stats_scraper() is not None:
