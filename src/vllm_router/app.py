@@ -32,6 +32,7 @@ from vllm_router.routers.batches_router import batches_router
 from vllm_router.routers.files_router import files_router
 from vllm_router.routers.main_router import main_router
 from vllm_router.routers.metrics_router import metrics_router
+from vllm_router.routers.passthrough_router import passthrough_router
 from vllm_router.routers.routing_logic import (
     AllInitRoutingLogics,
     DefaultInitRoutingLogics,
@@ -328,6 +329,9 @@ app.include_router(main_router)
 app.include_router(files_router)
 app.include_router(batches_router)
 app.include_router(metrics_router)
+# Must stay last: it owns a catch-all whose pattern would otherwise shadow the
+# three-segment routes declared above (e.g. /v1/files/{file_id}).
+app.include_router(passthrough_router)
 app.state.aiohttp_client_wrapper = AiohttpClientWrapper()
 app.state.semantic_cache_available = semantic_cache_available
 

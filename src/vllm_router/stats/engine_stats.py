@@ -145,6 +145,14 @@ class EngineStatsScraper(metaclass=SingletonMeta):
         endpoints = get_service_discovery().get_endpoint_info()
         logger.info(f"Scraping metrics from {len(endpoints)} serving engine(s)")
         for info in endpoints:
+            # A passthrough engine serves no vLLM /metrics, so scraping it can
+            # only ever fail. It matters more than a wasted request: this loop
+            # is serial and the per-request timeout equals scrape_interval, so
+            # one unresponsive passthrough pod delays every real engine behind
+            # it — the same stall the discovery path avoids by not probing.
+            if info.passthrough:
+                continue
+
             url = info.url
             engine_stats = self._scrape_one_endpoint(url)
             if engine_stats:
