@@ -24,9 +24,10 @@ class AiohttpClientWrapper:
 
     def start(self):
         """Instantiate the client. Call from the FastAPI startup hook."""
-        # To fully leverage the router's concurrency capabilities,
-        # we set the maximum number of connections to be unlimited.
-        self.async_client = aiohttp.ClientSession()
+        # Allow total concurrency to scale across backends while keeping each
+        # backend connection pool bounded.
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=100)
+        self.async_client = aiohttp.ClientSession(connector=connector)
         logger.info(f"aiohttp ClientSession instantiated. Id {id(self.async_client)}")
 
     async def stop(self):

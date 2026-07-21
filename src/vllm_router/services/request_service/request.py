@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # --- Request Processing & Routing ---
+import asyncio
 import json
 import os
 import time
@@ -22,7 +23,6 @@ from typing import Optional
 import aiohttp
 from fastapi import BackgroundTasks, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
-from requests import JSONDecodeError
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
@@ -97,19 +97,19 @@ async def process_request(
     Raises:
         HTTPError: If the backend returns a 4xx or 5xx status code.
     """
-    first_token = False
-    total_len = 0
-    start_time = time.time()
-    request.app.state.request_stats_monitor.on_new_request(
-        backend_url, request_id, start_time
-    )
     # Check if this is a streaming request
     try:
         request_json = json.loads(body)
         is_streaming = request_json.get("stream", False)
-    except JSONDecodeError:
+    except json.JSONDecodeError:
         # If we can't parse the body as JSON, assume it's not streaming
         raise HTTPException(status=400, detail="Request body is not JSON parsable.")
+
+    first_token = False
+    total_len = 0
+    start_time = time.time()
+    request_stats_monitor = request.app.state.request_stats_monitor
+    request_stats_monitor.on_new_request(backend_url, request_id, start_time)
 
     # sanitize the request headers
     headers = {
@@ -119,31 +119,59 @@ async def process_request(
     # For non-streaming requests, collect the full response to cache it properly
     full_response = bytearray()
 
-    async with request.app.state.aiohttp_client_wrapper().request(
-        method=request.method,
-        url=backend_url + endpoint,
-        headers=headers,
-        data=body,
-        timeout=aiohttp.ClientTimeout(total=None),
-    ) as backend_response:
-        # Yield headers and status code first.
-        yield backend_response.headers, backend_response.status
-        # Stream response content.
-        async for chunk in backend_response.content.iter_any():
-            total_len += len(chunk)
-            if not first_token:
-                first_token = True
-                request.app.state.request_stats_monitor.on_request_response(
-                    backend_url, request_id, time.time()
-                )
-            # For non-streaming requests, collect the full response
-            if full_response is not None:
-                full_response.extend(chunk)
-            yield chunk
-
-    request.app.state.request_stats_monitor.on_request_complete(
-        backend_url, request_id, time.time()
-    )
+    success = False
+    outcome = "client_disconnected"
+    exception_type = "GeneratorExit"
+    try:
+        async with request.app.state.aiohttp_client_wrapper().request(
+            method=request.method,
+            url=backend_url + endpoint,
+            headers=headers,
+            data=body,
+            timeout=aiohttp.ClientTimeout(total=None),
+        ) as backend_response:
+            # Yield headers and status code first.
+            yield backend_response.headers, backend_response.status
+            # Stream response content.
+            async for chunk in backend_response.content.iter_any():
+                total_len += len(chunk)
+                if not first_token:
+                    first_token = True
+                    request_stats_monitor.on_request_response(
+                        backend_url, request_id, time.time()
+                    )
+                # For non-streaming requests, collect the full response
+                if full_response is not None:
+                    full_response.extend(chunk)
+                yield chunk
+        success = True
+        outcome = "completed"
+        exception_type = None
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        exception_type = "CancelledError"
+        raise
+    except GeneratorExit:
+        raise
+    except Exception as exc:
+        outcome = "backend_error"
+        exception_type = type(exc).__name__
+        raise
+    finally:
+        stage, active_after = request_stats_monitor.on_request_complete(
+            backend_url, request_id, time.time(), success=success
+        )
+        if not success:
+            logger.warning(
+                "request_terminated request_id=%s backend=%s stage=%s outcome=%s "
+                "exception_type=%s active_after=%s",
+                request_id,
+                backend_url,
+                stage,
+                outcome,
+                exception_type,
+                active_after,
+            )
 
     # if debug_request:
     #    logger.debug(f"Finished the request with request id: {debug_request.headers.get('x-request-id', None)} at {time.time()}")
@@ -225,7 +253,7 @@ async def route_general_request(
         # Update request_json if the body was rewritten
         try:
             request_json = json.loads(request_body)
-        except JSONDecodeError:
+        except json.JSONDecodeError:
             logger.warning("Failed to parse rewritten request body as JSON")
             raise HTTPException(
                 status_code=400, detail="Request body is not JSON parsable."

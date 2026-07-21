@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Set, Tuple
@@ -212,7 +211,9 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
         ttft = timestamp - self.request_start_time[(engine_url, request_id)]
         self.ttft_monitors[engine_url].update(timestamp, ttft)
 
-    def on_request_complete(self, engine_url: str, request_id: str, timestamp: float):
+    def on_request_complete(
+        self, engine_url: str, request_id: str, timestamp: float, success: bool = True
+    ) -> Tuple[str, int]:
         """
         Tell the monitor that a request has been completed.
 
@@ -221,21 +222,36 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
             request_id: The global request ID
             timestamp: The timestamp when the request was completed
         """
-        if engine_url not in self.finished_requests:
-            self.finished_requests[engine_url] = 0
-        self.in_decoding_requests[engine_url] = max(
-            0, self.in_decoding_requests.get(engine_url, 1) - 1
-        )
-        self.finished_requests[engine_url] += 1
+        request_key = (engine_url, request_id)
+        request_start_time = self.request_start_time.pop(request_key, None)
+        first_token_time = self.first_token_time.pop(request_key, None)
+        if request_start_time is None:
+            return "unknown", self.get_active_request_count(engine_url)
 
-        if request_start_time := self.request_start_time.get((engine_url, request_id)):
-            self.latency_monitors[engine_url].update(
-                timestamp, time.time() - request_start_time
+        if first_token_time is None:
+            stage = "prefill"
+            self.in_prefill_requests[engine_url] = max(
+                0, self.in_prefill_requests.get(engine_url, 0) - 1
+            )
+        else:
+            stage = "decoding"
+            self.in_decoding_requests[engine_url] = max(
+                0, self.in_decoding_requests.get(engine_url, 0) - 1
             )
 
-        # Remove from active requests
         if engine_url in self.active_requests:
             self.active_requests[engine_url].discard(request_id)
+        active_after = self.get_active_request_count(engine_url)
+
+        if success:
+            if engine_url not in self.finished_requests:
+                self.finished_requests[engine_url] = 0
+            self.finished_requests[engine_url] += 1
+            self.latency_monitors[engine_url].update(
+                timestamp, timestamp - request_start_time
+            )
+
+        return stage, active_after
 
     def on_request_swapped(self, engine_url: str, request_id: str, timestamp: float):
         # This function should be called if a request is determined to be swapped from GPU to CPU.

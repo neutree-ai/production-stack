@@ -1,6 +1,9 @@
 # lightweight Dockerfile for Neutree, never install lmcache/semantic_cache
 FROM python:3.12-slim
 
+ARG CLUSTER_VERSION=""
+LABEL neutree.ai/cluster-version="${CLUSTER_VERSION}"
+
 WORKDIR /app
 
 # hadolint ignore=DL3008

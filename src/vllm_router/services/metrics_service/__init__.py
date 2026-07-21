@@ -72,3 +72,26 @@ num_requests_swapped = Gauge(
     "Number of swapped requests",
     ["workspace", "endpoint", "server"],
 )
+
+
+_ENDPOINT_GAUGES = (
+    num_requests_running,
+    num_requests_waiting,
+    gpu_prefix_cache_hit_rate,
+    gpu_prefix_cache_hits_total,
+    gpu_prefix_cache_queries_total,
+    current_qps,
+    avg_decoding_length,
+    num_prefill_requests,
+    num_decoding_requests,
+    healthy_pods_total,
+    avg_latency,
+    avg_itl,
+    num_requests_swapped,
+)
+
+
+def clear_endpoint_metrics():
+    """Remove endpoint-labelled Gauge series before rebuilding current discovery."""
+    for metric in _ENDPOINT_GAUGES:
+        metric.clear()
