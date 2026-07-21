@@ -24,24 +24,34 @@ class TestAdmission:
     on its routing key instead of on advertised models.
     """
 
-    admit = staticmethod(K8sPodIPServiceDiscovery._is_admissible)
+    @staticmethod
+    def admit(
+        *, ready=True, models=(), passthrough=False, workspace="ws", endpoint="ep"
+    ):
+        return K8sPodIPServiceDiscovery._is_admissible(
+            is_pod_ready=ready,
+            model_names=list(models),
+            passthrough=passthrough,
+            workspace=workspace,
+            endpoint=endpoint,
+        )
 
     def test_openai_engine_still_requires_models(self):
-        assert self.admit(True, ["m"], False, "ws", "ep") is True
-        assert self.admit(True, [], False, "ws", "ep") is False
+        assert self.admit(models=["m"]) is True
+        assert self.admit(models=[]) is False
 
     def test_passthrough_engine_admitted_without_models(self):
-        assert self.admit(True, [], True, "ws", "ep") is True
+        assert self.admit(models=[], passthrough=True) is True
 
     def test_passthrough_engine_needs_a_routing_key(self):
         # Without both labels it could never be selected; admitting it would
         # only put an unreachable entry in the pool.
-        assert self.admit(True, [], True, None, "ep") is False
-        assert self.admit(True, [], True, "ws", None) is False
+        assert self.admit(passthrough=True, workspace=None) is False
+        assert self.admit(passthrough=True, endpoint=None) is False
 
     def test_unready_pod_never_admitted(self):
-        assert self.admit(False, ["m"], False, "ws", "ep") is False
-        assert self.admit(False, [], True, "ws", "ep") is False
+        assert self.admit(ready=False, models=["m"]) is False
+        assert self.admit(ready=False, passthrough=True) is False
 
 
 class TestBackendSelection:
@@ -58,6 +68,16 @@ class TestBackendSelection:
         assert _select_backend(endpoints, ("ws", "one")).url == "a"
         assert _select_backend(endpoints, ("ws", "two")).url == "a"
         assert _select_backend(endpoints, ("ws", "one")).url == "b"
+
+    def test_rotation_is_stable_across_pool_reordering(self):
+        # Service discovery hands back insertion-ordered values, so a pod
+        # restart can permute the list. Selection must not depend on that.
+        forward = [_endpoint("a"), _endpoint("b"), _endpoint("c")]
+        reverse = list(reversed(forward))
+        first = [_select_backend(forward, ("ws", "ep")).url for _ in range(3)]
+        _rr_counters.clear()
+        second = [_select_backend(reverse, ("ws", "ep")).url for _ in range(3)]
+        assert first == second
 
     def test_survives_pool_shrinking_between_calls(self):
         three = [_endpoint("a"), _endpoint("b"), _endpoint("c")]

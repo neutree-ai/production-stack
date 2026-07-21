@@ -31,10 +31,8 @@ explicitly declared routes -- including the three-segment ones such as
 ``/v1/files/{file_id}`` -- win the match.
 """
 
-import itertools
-import threading
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import aiohttp
 from fastapi import APIRouter, Request
@@ -49,33 +47,30 @@ passthrough_router = APIRouter()
 
 logger = init_logger(__name__)
 
-_PASSTHROUGH_METHODS = [
-    "GET",
-    "POST",
-    "PUT",
-    "PATCH",
-    "DELETE",
-    "HEAD",
-    "OPTIONS",
-]
+# HEAD is omitted deliberately: Starlette adds it whenever GET is present.
+_PASSTHROUGH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# One long-lived aiohttp timeout for every proxied request. Immutable, so it is
+# safe to share and pointless to rebuild per request.
+_NO_TIMEOUT = aiohttp.ClientTimeout(total=None)
 
 # Round-robin cursors, one per (workspace, endpoint). Passthrough workloads are
 # opaque to the router, so none of the OpenAI-aware strategies (prefix cache,
 # session affinity, KV-aware) have anything to work with here.
-_rr_counters: Dict[Tuple[str, str], "itertools.count[int]"] = {}
-_rr_lock = threading.Lock()
+#
+# No lock: handlers are async and this function never awaits, so it cannot be
+# preempted between the read and the write.
+_rr_counters: Dict[Tuple[str, str], int] = {}
 
 
 def _select_backend(
     endpoints: List[EndpointInfo], key: Tuple[str, str]
 ) -> EndpointInfo:
-    with _rr_lock:
-        counter = _rr_counters.get(key)
-        if counter is None:
-            counter = itertools.count()
-            _rr_counters[key] = counter
-        index = next(counter)
-    return endpoints[index % len(endpoints)]
+    index = _rr_counters.get(key, 0)
+    _rr_counters[key] = index + 1
+    # Sorted, so the rotation survives service discovery handing back the pool
+    # in a different order after a pod restart.
+    return sorted(endpoints, key=lambda e: e.url)[index % len(endpoints)]
 
 
 def _passthrough_endpoints(workspace: str, endpoint: str) -> List[EndpointInfo]:
@@ -111,7 +106,7 @@ async def _stream_upstream(
         headers=headers,
         params=request.query_params.multi_items(),
         data=body,
-        timeout=aiohttp.ClientTimeout(total=None),
+        timeout=_NO_TIMEOUT,
     ) as backend_response:
         yield backend_response.headers, backend_response.status
         async for chunk in backend_response.content.iter_any():
@@ -169,11 +164,10 @@ async def route_passthrough_request(
     }
     response_headers["X-Request-Id"] = request_id
 
-    media_type: Optional[str] = upstream_headers.get("Content-Type")
-
+    # No media_type=: Content-Type is already in response_headers, and
+    # Response.init_headers only fills one in when the headers dict lacks it.
     return StreamingResponse(
         stream,
         status_code=status,
         headers=response_headers,
-        media_type=media_type,
     )

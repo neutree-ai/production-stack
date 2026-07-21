@@ -136,7 +136,7 @@ class EndpointInfo:
     passthrough: bool = False
 
     def __str__(self):
-        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic})"
+        return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, passthrough={self.passthrough})"
 
     def get_base_models(self) -> List[str]:
         """
@@ -837,7 +837,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: str,
         endpoint: str,
         routing_logic: str,
-        passthrough: bool = False,
+        passthrough: bool,
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -913,6 +913,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
     @staticmethod
     def _is_admissible(
+        *,
         is_pod_ready: bool,
         model_names: List[str],
         passthrough: bool,
@@ -944,7 +945,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
-        passthrough: bool = False,
+        passthrough: bool,
     ) -> None:
         """
         Handle engine update events from Kubernetes watcher.
@@ -958,7 +959,11 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 return
 
             if not self._is_admissible(
-                is_pod_ready, model_names, passthrough, workspace, endpoint
+                is_pod_ready=is_pod_ready,
+                model_names=model_names,
+                passthrough=passthrough,
+                workspace=workspace,
+                endpoint=endpoint,
             ):
                 return
 
@@ -986,7 +991,11 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             # Check if engine availability status changed
             was_available = engine_name in self.available_engines
             is_now_available = self._is_admissible(
-                is_pod_ready, model_names, passthrough, workspace, endpoint
+                is_pod_ready=is_pod_ready,
+                model_names=model_names,
+                passthrough=passthrough,
+                workspace=workspace,
+                endpoint=endpoint,
             )
 
             if is_now_available and not was_available:
