@@ -130,6 +130,11 @@ class EndpointInfo:
     # Routing logic
     routing_logic: Optional[str] = None
 
+    # Whether this engine opts out of OpenAI-shaped routing. Passthrough
+    # engines are admitted without a /v1/models probe and are reachable only
+    # through the catch-all router, keyed on (workspace, endpoint).
+    passthrough: bool = False
+
     def __str__(self):
         return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic})"
 
@@ -733,6 +738,24 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return pod.metadata.labels.get("routing_logic")
 
+    def _get_passthrough(self, pod) -> bool:
+        """
+        Get the passthrough flag from the pod's metadata labels.
+
+        A pod labelled ``passthrough=true`` serves a workload that is not
+        OpenAI-compatible. It is admitted to the pool without a /v1/models
+        probe and is only reachable through the catch-all router.
+
+        Args:
+            pod: The Kubernetes pod object
+
+        Returns:
+            True if the pod opts into passthrough routing, False otherwise
+        """
+        if not pod.metadata.labels:
+            return False
+        return pod.metadata.labels.get("passthrough", "").lower() == "true"
+
     def _watch_engines(self):
         while self.running:
             try:
@@ -761,8 +784,17 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     # Pod is ready if container is ready and pod is not terminating
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
+                    passthrough = self._get_passthrough(pod)
+
                     if is_pod_ready:
-                        model_names = self._get_model_names(pod_ip)
+                        # A passthrough workload has no /v1/models to probe.
+                        # Skipping it matters for more than tidiness: the probe
+                        # runs inline in this watcher thread, so two failed
+                        # calls at health_check_timeout_seconds each would
+                        # stall discovery of every other pod behind it.
+                        model_names = (
+                            [] if passthrough else self._get_model_names(pod_ip)
+                        )
                         model_label = self._get_model_label(pod)
                         workspace = self._get_workspace(pod)
                         endpoint = self._get_endpoint(pod)
@@ -790,6 +822,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                         workspace,
                         endpoint,
                         routing_logic,
+                        passthrough,
                     )
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
@@ -804,17 +837,19 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: str,
         endpoint: str,
         routing_logic: str,
+        passthrough: bool = False,
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
-            f"{engine_ip}, running models: {model_names}"
+            f"{engine_ip}, running models: {model_names}, passthrough: {passthrough}"
         )
 
-        # Get detailed model information
-        model_info = self._get_model_info(engine_ip)
+        # Get detailed model information. Passthrough engines serve no
+        # /v1/models, so skip the probe rather than pay its timeout.
+        model_info = {} if passthrough else self._get_model_info(engine_ip)
 
         # Check if engine is enabled with sleep mode and set engine sleep status
-        if self._check_engine_sleep_mode(engine_name):
+        if not passthrough and self._check_engine_sleep_mode(engine_name):
             sleep_status = self._get_engine_sleep_status(engine_ip)
         else:
             sleep_status = False
@@ -833,6 +868,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace=workspace,
                 endpoint=endpoint,
                 routing_logic=routing_logic,
+                passthrough=passthrough,
             )
 
             # Store model information in the endpoint info
@@ -875,6 +911,28 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             endpoint_info,
         )
 
+    @staticmethod
+    def _is_admissible(
+        is_pod_ready: bool,
+        model_names: List[str],
+        passthrough: bool,
+        workspace: Optional[str],
+        endpoint: Optional[str],
+    ) -> bool:
+        """
+        Decide whether a pod belongs in the routable pool.
+
+        An OpenAI-compatible engine qualifies by advertising at least one model.
+        A passthrough engine has no models to advertise, so it qualifies on its
+        routing key instead: without both labels it could never be selected,
+        and admitting it would only add an unreachable entry to the pool.
+        """
+        if not is_pod_ready:
+            return False
+        if passthrough:
+            return bool(workspace and endpoint)
+        return bool(model_names)
+
     def _on_engine_update(
         self,
         engine_name: str,
@@ -886,6 +944,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         workspace: Optional[str],
         endpoint: Optional[str],
         routing_logic: Optional[str],
+        passthrough: bool = False,
     ) -> None:
         """
         Handle engine update events from Kubernetes watcher.
@@ -898,8 +957,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             if engine_ip is None:
                 return
 
-            # Only add engine if pod is ready and has models
-            if not is_pod_ready or not model_names:
+            if not self._is_admissible(
+                is_pod_ready, model_names, passthrough, workspace, endpoint
+            ):
                 return
 
             self._add_engine(
@@ -910,6 +970,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 workspace,
                 endpoint,
                 routing_logic,
+                passthrough,
             )
 
         elif event == "DELETED":
@@ -924,7 +985,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
             # Check if engine availability status changed
             was_available = engine_name in self.available_engines
-            is_now_available = is_pod_ready and model_names
+            is_now_available = self._is_admissible(
+                is_pod_ready, model_names, passthrough, workspace, endpoint
+            )
 
             if is_now_available and not was_available:
                 # Engine became available: trigger ENGINE_ADDED
@@ -936,6 +999,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     workspace,
                     endpoint,
                     routing_logic,
+                    passthrough,
                 )
             elif not is_now_available and was_available:
                 # Engine became unavailable: trigger ENGINE_DELETED
