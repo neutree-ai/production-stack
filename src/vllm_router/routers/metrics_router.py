@@ -18,6 +18,7 @@ import psutil
 from fastapi import APIRouter, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 
+from vllm_router.log import init_logger
 from vllm_router.service_discovery import get_service_discovery
 from vllm_router.services.metrics_service import (
     avg_decoding_length,
@@ -38,6 +39,13 @@ from vllm_router.stats.engine_stats import get_engine_stats_scraper
 from vllm_router.stats.request_stats import get_request_stats_monitor
 
 metrics_router = APIRouter()
+logger = init_logger(__name__)
+
+# Start the measurement window without blocking the event loop (upstream #1168).
+try:
+    psutil.cpu_percent(interval=None)
+except Exception as exc:
+    logger.warning("Failed to start CPU usage measurement: %s", exc)
 
 # Define Gauges for system resource usage
 router_cpu_usage_percent = Gauge(
@@ -74,8 +82,7 @@ async def metrics():
         the appropriate content type.
     """
 
-    # Collect CPU utilization (short interval)
-    cpu_percent = psutil.cpu_percent(interval=0.1)
+    cpu_percent = psutil.cpu_percent(interval=None)
     router_cpu_usage_percent.set(cpu_percent)
 
     # Collect memory utilization
