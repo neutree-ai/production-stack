@@ -96,6 +96,43 @@ async def route_embeddings(
     )
 
 
+# Adapted from production-stack #1112 with Neutree's scoped route prefix.
+@main_router.post("/{workspace}/{endpoint}/pooling")
+async def route_pooling(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/pooling", background_tasks, workspace, endpoint
+    )
+
+
+@main_router.post("/{workspace}/{endpoint}/classify")
+async def route_classification(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/classify", background_tasks, workspace, endpoint
+    )
+
+
+@main_router.post("/{workspace}/{endpoint}/v1/audio/translations")
+async def route_audio_translation(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_transcriptions(
+        request, "/v1/audio/translations", background_tasks, workspace, endpoint
+    )
+
+
+@main_router.post("/{workspace}/{endpoint}/v1/audio/transcriptions")
+async def route_scoped_audio_transcription(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_transcriptions(
+        request, "/v1/audio/transcriptions", background_tasks, workspace, endpoint
+    )
+
+
 @main_router.post("/{workspace}/{endpoint}/tokenize")
 async def route_tokenize(
     workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks

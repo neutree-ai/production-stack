@@ -181,3 +181,64 @@ The response will be a JSON object with the current dynamic config.
     "dynamic_config": <current_dynamic_config (JSON object)>
 }
 ```
+
+
+## Backend HTTP controls (Neutree v1.3.0)
+
+Every inference path uses the same backend transport: JSON, multipart, passthrough
+and existing P/D forwarding. There is no total request-duration limit. Each phase
+has its own timeout; `0` disables that timeout. Pool capacity `0` means unlimited.
+
+| CLI flag / JSON field | Default | Range |
+| --- | --- | --- |
+| `--max-connections-per-backend` / `max_connections_per_backend` | 100 | Integer 0–65535 |
+| `--pool-wait-timeout-seconds` / `pool_wait_timeout_seconds` | 60 | Finite seconds 0–604800 |
+| `--connect-timeout-seconds` / `connect_timeout_seconds` | 10 | Finite seconds 0–604800 |
+| `--response-header-timeout-seconds` / `response_header_timeout_seconds` | 0 | Finite seconds 0–604800 |
+| `--response-read-timeout-seconds` / `response_read_timeout_seconds` | 600 | Finite seconds 0–604800 |
+| `--stream-idle-timeout-seconds` / `stream_idle_timeout_seconds` | 600 | Finite seconds 0–604800 |
+
+Pool wait excludes DNS/connect. Header wait starts after sending the request body
+and ends when response headers have been parsed. Body/stream idle deadlines start
+after headers and reset for each read. A stream that keeps sending data can run
+longer than all individual deadlines. Header wait defaults to disabled because a
+long non-streaming inference may not send headers until generation finishes.
+
+JSON/YAML configuration uses the field names in the table. Missing or `null`
+values use defaults, while explicit `0` is retained. Transport changes in a
+running configuration watcher are rejected before discovery is changed; restart
+the Router to apply them. Neutree Cluster configuration changes roll out the
+Deployment. Unreachable backends return 503; timeouts before response headers
+return 504. Failures after headers abort the stream rather than fabricate a new
+HTTP status or append an unrelated error body.
+
+The existing `/metrics` exports forwarding gauges, response-header latency and
+mutually exclusive terminal counters, labelled by discovered workspace, endpoint
+and backend. These describe Router transport rather than engine queues or token
+latency. Retired, inactive backend series expire after five minutes. Kubernetes
+discovery re-lists complete paginated snapshots before watching the corresponding
+resource version; watch streams have bounded I/O, retry backoff and a 60-second
+freshness limit. New requests do not use stale discovery selections.
+
+## Inference API coverage
+
+Neutree inference URLs have the prefix `/{workspace}/{endpoint}`. The additional
+fixed POST routes are `/pooling`, `/classify`, `/v1/audio/translations` and scoped
+`/v1/audio/transcriptions`; the legacy unscoped transcription route remains.
+JSON fields, multipart repeated fields, status codes and content types are
+forwarded. Static health checks support `pooling`, `classification` and
+`translation` model types. Generation-prefix routing falls back to existing
+load selection for payloads without a prompt or messages.
+
+| API suffix | Payload | vLLM 0.24.0 / 0.31.0 requirement |
+| --- | --- | --- |
+| `/pooling` | JSON `model` and `input` | Pooling model |
+| `/classify` | JSON `model` and `input` | Classification model |
+| `/v1/audio/translations` | Multipart `model`, `file` and optional fields | ASR model |
+
+The versioned [vLLM 0.24.0 serving documentation](https://docs.vllm.ai/en/v0.24.0/serving/online_serving/)
+and [vLLM 0.31.0 serving documentation](https://docs.vllm.ai/en/v0.31.0/serving/online_serving/)
+list these APIs; actual model support still comes from the deployed engine.
+This change does not add global Kong model-routing entries or new engine task
+registrations. It preserves the endpoint-scoped Router URLs. Responses API and
+speech synthesis are deferred; management/debug endpoints are not expanded.

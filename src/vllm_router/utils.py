@@ -72,6 +72,9 @@ class ModelType(enum.Enum):
     rerank = "rerank"
     score = "score"
     transcription = "transcription"
+    translation = "translation"
+    pooling = "pooling"
+    classification = "classification"
     vision = "vision"
 
     @staticmethod
@@ -89,6 +92,12 @@ class ModelType(enum.Enum):
                 return "/v1/score"
             case ModelType.transcription:
                 return "/v1/audio/transcriptions"
+            case ModelType.translation:
+                return "/v1/audio/translations"
+            case ModelType.pooling:
+                return "/pooling"
+            case ModelType.classification:
+                return "/classify"
 
     @staticmethod
     def get_test_payload(model_type: str):
@@ -106,13 +115,13 @@ class ModelType(enum.Enum):
                 }
             case ModelType.completion:
                 return {"prompt": "Hello", "max_tokens": 3}
-            case ModelType.embeddings:
+            case ModelType.embeddings | ModelType.pooling | ModelType.classification:
                 return {"input": "Hello"}
             case ModelType.rerank:
                 return {"query": "Hello", "documents": ["Test"]}
             case ModelType.score:
                 return {"encoding_format": "float", "text_1": "Test", "test_2": "Test2"}
-            case ModelType.transcription:
+            case ModelType.transcription | ModelType.translation:
                 if _SILENT_WAV_BYTES is not None:
                     logger.debug("=====Silent WAV Bytes is being used=====")
                     return {
@@ -226,7 +235,7 @@ def is_model_healthy(url: str, model: str, model_type: str) -> bool:
     model_url = ModelType.get_url(model_type)
 
     try:
-        if model_type == "transcription":
+        if model_type in {"transcription", "translation"}:
             # for transcription, the backend expects multipart/form-data with a file
             # we will use pre-generated silent wav bytes
             response = requests.post(
@@ -246,7 +255,7 @@ def is_model_healthy(url: str, model: str, model_type: str) -> bool:
 
         response.raise_for_status()
 
-        if model_type == "transcription":
+        if model_type in {"transcription", "translation"}:
             return True
         else:
             response.json()  # verify it's valid json for other model types

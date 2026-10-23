@@ -468,6 +468,10 @@ class PrefixAwareRouter(RoutingInterface):
             longest prefix match)
         """
 
+        # Pooling, classification and audio payloads have no generation prefix.
+        if "messages" not in request_json and "prompt" not in request_json:
+            return self._qps_routing(endpoints, request_stats)
+
         # Handle chat completions
         if "messages" in request_json:
             # Get the last message from the messages array
