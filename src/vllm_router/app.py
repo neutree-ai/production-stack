@@ -49,6 +49,7 @@ from vllm_router.service_discovery import (
 from vllm_router.services.batch_service import initialize_batch_processor
 from vllm_router.services.callbacks_service.callbacks import configure_custom_callbacks
 from vllm_router.services.files_service import initialize_storage
+from vllm_router.services.metrics_service.forwarding import observe_forwarding
 from vllm_router.services.request_service.rewriter import (
     get_request_rewriter,
 )
@@ -137,6 +138,7 @@ def initialize_all(app: FastAPI, args):
         ValueError: if the service discovery type is invalid
     """
     app.state.aiohttp_client_wrapper.configure(BackendHttpConfig.from_args(args))
+    app.state.aiohttp_client_wrapper.observer = observe_forwarding
 
     if sentry_dsn := args.sentry_dsn:
         sentry_sdk.init(

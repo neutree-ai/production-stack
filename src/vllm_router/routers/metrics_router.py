@@ -35,6 +35,7 @@ from vllm_router.services.metrics_service import (
     num_requests_running,
     num_requests_swapped,
 )
+from vllm_router.services.metrics_service.forwarding import prune_forwarding_metrics
 from vllm_router.stats.engine_stats import get_engine_stats_scraper
 from vllm_router.stats.request_stats import get_request_stats_monitor
 
@@ -94,6 +95,7 @@ async def metrics():
     router_disk_usage_percent.set(disk_percent)
 
     endpoints = get_service_discovery().get_endpoint_info()
+    prune_forwarding_metrics(endpoints)
     stats = get_request_stats_monitor().get_request_stats(time.time())
     clear_endpoint_metrics()
     for ep in endpoints:
