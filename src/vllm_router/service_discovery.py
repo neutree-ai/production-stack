@@ -22,11 +22,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
-import aiohttp
 import requests
-from kubernetes import client, config, watch
+from kubernetes import client, config
 
 from vllm_router import utils
+from vllm_router.backend_http import BackendEndpoint
+from vllm_router.kubernetes_watch import KubernetesWatch
 from vllm_router.log import init_logger
 
 logger = init_logger(__name__)
@@ -134,6 +135,8 @@ class EndpointInfo:
     # engines are admitted without a /v1/models probe and are reachable only
     # through the catch-all router, keyed on (workspace, endpoint).
     passthrough: bool = False
+    resource_uid: Optional[str] = None
+    resource_signature: Optional[tuple] = None
 
     def __str__(self):
         return f"EndpointInfo(url={self.url}, model_names={self.model_names}, added_timestamp={self.added_timestamp}, model_label={self.model_label}, service_name={self.service_name},pod_name={self.pod_name}, namespace={self.namespace}, workspace={self.workspace}, endpoint={self.endpoint}, routing_logic={self.routing_logic}, passthrough={self.passthrough})"
@@ -355,25 +358,26 @@ class StaticServiceDiscovery(ServiceDiscovery):
 
     async def initialize_client_sessions(self) -> None:
         """
-        Initialize aiohttp ClientSession objects for prefill and decode endpoints.
-        This must be called from an async context during app startup.
+        Select P/D endpoint metadata; networking uses the shared backend wrapper.
         """
-        if (
-            self.prefill_model_labels is not None
-            and self.decode_model_labels is not None
+        if self.prefill_model_labels is None or self.decode_model_labels is None:
+            return
+        endpoints = self.get_endpoint_info()
+        for role, labels in (
+            ("prefill", self.prefill_model_labels),
+            ("decode", self.decode_model_labels),
         ):
-            endpoint_infos = self.get_endpoint_info()
-            for endpoint_info in endpoint_infos:
-                if endpoint_info.model_label in self.prefill_model_labels:
-                    self.app.state.prefill_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
-                elif endpoint_info.model_label in self.decode_model_labels:
-                    self.app.state.decode_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
+            selected = next((ep for ep in endpoints if ep.model_label in labels), None)
+            name = f"{role}_client"
+            current = getattr(self.app.state, name, None)
+            if selected is None:
+                setattr(self.app.state, name, None)
+            else:
+                target = BackendEndpoint(
+                    selected.url, selected.workspace or "", selected.endpoint or ""
+                )
+                if current != target:
+                    setattr(self.app.state, name, target)
 
     def close(self):
         """
@@ -410,7 +414,106 @@ class StaticServiceDiscovery(ServiceDiscovery):
             self.loop.close()
 
 
-class K8sPodIPServiceDiscovery(ServiceDiscovery):
+class _KubernetesDiscovery:
+    """Own watcher/session lifetime; no thread waits for the FastAPI loop."""
+
+    def _init_watcher(self, list_resources, kind):
+        self.event_loop = None
+        self._session_refresh_pending = False
+        self._session_lock = None
+        self._watch_kind = kind
+        self._watch = KubernetesWatch(self, list_resources)
+        self.k8s_watcher = self._watch.watcher
+        self.watcher_thread = self._watch.thread
+        self.running = True
+        loop = getattr(self.app.state, "event_loop", None)
+        if loop is not None and loop.is_running():
+            self.set_event_loop(loop)
+
+    def set_event_loop(self, loop):
+        self.event_loop = loop
+        self._watch.start()
+        self._schedule_sessions()
+
+    def _schedule_sessions(self):
+        if not self.running or self.event_loop is None or self._session_refresh_pending:
+            return
+        if self.prefill_model_labels is None or self.decode_model_labels is None:
+            return
+        self._session_refresh_pending = True
+
+        async def refresh():
+            try:
+                await self.initialize_client_sessions()
+            finally:
+                self._session_refresh_pending = False
+
+        if not self.event_loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(refresh(), self.event_loop)
+
+            def finished(result):
+                try:
+                    result.result()
+                except Exception:
+                    logger.exception("Failed to refresh P/D clients")
+
+            future.add_done_callback(finished)
+        else:
+            self._session_refresh_pending = False
+
+    def _watch_engines(self):
+        self._watch.run()
+
+    def _reconcile_engines(self):
+        return self._watch.reconcile()
+
+    def get_health(self):
+        return self._watch.healthy()
+
+    def get_endpoint_info(self):
+        # Keep a failed List from destroying the cache, but stop routing stale data.
+        if self._watch.last_success is not None and not self._watch.healthy():
+            return []
+        with self.available_engines_lock:
+            return list(self.available_engines.values())
+
+    def close(self):
+        self.running = False
+        self._watch.close()
+
+    async def initialize_client_sessions(self):
+        if self.prefill_model_labels is None or self.decode_model_labels is None:
+            return
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if not self.running:
+                return
+            endpoints = self.get_endpoint_info()
+            for role, labels in (
+                ("prefill", self.prefill_model_labels),
+                ("decode", self.decode_model_labels),
+            ):
+                name = f"{role}_client"
+                selected = next(
+                    (ep for ep in endpoints if ep.model_label in labels), None
+                )
+                old = getattr(self.app.state, name, None)
+                if selected is None:
+                    setattr(self.app.state, name, None)
+                    continue
+                target = BackendEndpoint(
+                    selected.url, selected.workspace or "", selected.endpoint or ""
+                )
+                if old != target:
+                    setattr(self.app.state, name, target)
+
+    async def close_client_sessions(self):
+        self.app.state.prefill_client = None
+        self.app.state.decode_client = None
+
+
+class K8sPodIPServiceDiscovery(_KubernetesDiscovery, ServiceDiscovery):
     def __init__(
         self,
         app,
@@ -457,14 +560,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             config.load_kube_config()
 
         self.k8s_api = client.CoreV1Api()
-        self.k8s_watcher = watch.Watch()
-
-        # Start watching engines
-        self.running = True
-        self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
-        self.watcher_thread.start()
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
+        self._init_watcher(self.k8s_api.list_namespaced_pod, "V1Pod")
 
     def _trigger_callbacks(
         self,
@@ -562,7 +660,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         try:
             enable_sleep_mode = False
             pod = self.k8s_api.read_namespaced_pod(
-                name=pod_name, namespace=self.namespace
+                name=pod_name, namespace=self.namespace, _request_timeout=(3, 10)
             )
             for container in pod.spec.containers:
                 if container.name == "vllm":
@@ -582,7 +680,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
     def add_sleep_label(self, pod_name):
         try:
             pod = self.k8s_api.read_namespaced_pod(
-                name=pod_name, namespace=self.namespace
+                name=pod_name, namespace=self.namespace, _request_timeout=(3, 10)
             )
             # pod.metadata.labels = {"sleeping": "true"}
             pod.metadata.labels.update({"sleeping": "true"})
@@ -600,7 +698,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             body = {"metadata": {"labels": {label_key: None}}}
 
             pod = self.k8s_api.read_namespaced_pod(
-                name=pod_name, namespace=self.namespace
+                name=pod_name, namespace=self.namespace, _request_timeout=(3, 10)
             )
             if label_key in pod.metadata.labels:
                 self.k8s_api.patch_namespaced_pod(
@@ -756,77 +854,71 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return False
         return pod.metadata.labels.get("passthrough", "").lower() == "true"
 
-    def _watch_engines(self):
-        while self.running:
-            try:
-                for event in self.k8s_watcher.stream(
-                    self.k8s_api.list_namespaced_pod,
-                    namespace=self.namespace,
-                    label_selector=self.label_selector,
-                    timeout_seconds=self.watcher_timeout_seconds,
-                ):
-                    pod = event["object"]
-                    event_type = event["type"]
-                    pod_name = pod.metadata.name
-                    pod_ip = pod.status.pod_ip
-
-                    if event_type == "DELETED":
-                        if pod_name in self.available_engines:
-                            self._delete_engine(pod_name)
-                        continue
-
-                    # Check if pod is terminating
-                    is_pod_terminating = self._is_pod_terminating(pod)
-                    is_container_ready = self._check_pod_ready(
-                        pod.status.container_statuses
-                    )
-
-                    # Pod is ready if container is ready and pod is not terminating
-                    is_pod_ready = is_container_ready and not is_pod_terminating
-
-                    passthrough = self._get_passthrough(pod)
-
-                    if is_pod_ready:
-                        # A passthrough workload has no /v1/models to probe.
-                        # Skipping it matters for more than tidiness: the probe
-                        # runs inline in this watcher thread, so two failed
-                        # calls at health_check_timeout_seconds each would
-                        # stall discovery of every other pod behind it.
-                        model_names = (
-                            [] if passthrough else self._get_model_names(pod_ip)
-                        )
-                        model_label = self._get_model_label(pod)
-                        workspace = self._get_workspace(pod)
-                        endpoint = self._get_endpoint(pod)
-                        routing_logic = self._get_routing_logic(pod)
-                    else:
-                        model_names = []
-                        model_label = None
-                        workspace = None
-                        endpoint = None
-                        routing_logic = None
-
-                    # Record pod status for debugging
-                    if is_container_ready and is_pod_terminating:
-                        logger.info(
-                            f"Pod {pod_name} has ready containers but is terminating - marking as unavailable"
-                        )
-
-                    self._on_engine_update(
-                        pod_name,
-                        pod_ip,
-                        event_type,
-                        is_pod_ready,
-                        model_names,
-                        model_label,
-                        workspace,
-                        endpoint,
-                        routing_logic,
-                        passthrough,
-                    )
-            except Exception as e:
-                logger.error(f"K8s watcher error: {e}")
-                time.sleep(0.5)
+    def _handle_resource(self, pod, event_type):
+        name = pod.metadata.name
+        uid = pod.metadata.uid
+        with self.available_engines_lock:
+            old = self.available_engines.get(name)
+        if event_type == "DELETED":
+            if old is not None and (
+                old.resource_uid is None or old.resource_uid == uid
+            ):
+                self._delete_engine(name)
+            return
+        ip = pod.status.pod_ip
+        ready = (
+            bool(ip)
+            and self._check_pod_ready(pod.status.container_statuses)
+            and not self._is_pod_terminating(pod)
+        )
+        if not ready:
+            self._delete_engine(name)
+            return
+        labels = pod.metadata.labels or {}
+        lora_modified = (pod.metadata.annotations or {}).get("lora-modified")
+        signature = (uid, ip, tuple(sorted(labels.items())), lora_modified)
+        if old is not None and old.resource_signature == signature:
+            return
+        # Invalidate changed identities before probing, but retain same-identity routes
+        # across a transient probe failure (the changed signature will be retried).
+        identity_changed = old is not None and (
+            old.resource_uid != uid
+            or old.url != f"http://{ip}:{self.port}"
+            or old.workspace != self._get_workspace(pod)
+            or old.endpoint != self._get_endpoint(pod)
+            or old.passthrough != self._get_passthrough(pod)
+        )
+        if identity_changed:
+            self._delete_engine(name)
+        passthrough = self._get_passthrough(pod)
+        models = [] if passthrough else self._get_model_names(ip)
+        if not self._is_admissible(
+            is_pod_ready=ready,
+            model_names=models,
+            passthrough=passthrough,
+            workspace=self._get_workspace(pod),
+            endpoint=self._get_endpoint(pod),
+        ):
+            return
+        if not self.running:
+            return
+        if old is not None and not identity_changed:
+            self._delete_engine(name)
+        self._add_engine(
+            name,
+            ip,
+            models,
+            self._get_model_label(pod),
+            self._get_workspace(pod),
+            self._get_endpoint(pod),
+            self._get_routing_logic(pod),
+            passthrough,
+            resource_uid=uid,
+            resource_signature=signature,
+            sleep_status=(
+                (labels["sleeping"] == "true") if "sleeping" in labels else None
+            ),
+        )
 
     def _add_engine(
         self,
@@ -838,6 +930,9 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         endpoint: str,
         routing_logic: str,
         passthrough: bool,
+        resource_uid=None,
+        resource_signature=None,
+        sleep_status=None,
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -847,12 +942,17 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         # Get detailed model information. Passthrough engines serve no
         # /v1/models, so skip the probe rather than pay its timeout.
         model_info = {} if passthrough else self._get_model_info(engine_ip)
+        if not self.running:
+            return
 
         # Check if engine is enabled with sleep mode and set engine sleep status
-        if not passthrough and self._check_engine_sleep_mode(engine_name):
-            sleep_status = self._get_engine_sleep_status(engine_ip)
-        else:
-            sleep_status = False
+        if sleep_status is None:
+            if not passthrough and self._check_engine_sleep_mode(engine_name):
+                sleep_status = self._get_engine_sleep_status(engine_ip)
+            else:
+                sleep_status = False
+        if not self.running:
+            return
 
         with self.available_engines_lock:
             self.available_engines[engine_name] = EndpointInfo(
@@ -869,6 +969,8 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 endpoint=endpoint,
                 routing_logic=routing_logic,
                 passthrough=passthrough,
+                resource_uid=resource_uid,
+                resource_signature=resource_signature,
             )
 
             # Store model information in the endpoint info
@@ -884,32 +986,21 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             endpoint_info,
         )
 
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self.initialize_client_sessions(),
-                self.app.state.event_loop,
-            )
-            fut.result()
-        except Exception as e:
-            logger.error(f"Error initializing client sessions: {e}")
+        self._schedule_sessions()
 
         # Track all models we've ever seen
         with self.known_models_lock:
             self.known_models.update(model_names)
 
     def _delete_engine(self, engine_name: str):
-        logger.info(f"Serving engine {engine_name} is deleted")
         with self.available_engines_lock:
-            # Get endpoint info before deletion for callback
-            endpoint_info = self.available_engines.get(engine_name)
-            del self.available_engines[engine_name]
-
-        # Trigger callbacks after releasing lock
+            endpoint_info = self.available_engines.pop(engine_name, None)
+        if endpoint_info is None:
+            return
         self._trigger_callbacks(
-            ServiceDiscoveryEventType.ENGINE_DELETED,
-            engine_name,
-            endpoint_info,
+            ServiceDiscoveryEventType.ENGINE_DELETED, engine_name, endpoint_info
         )
+        self._schedule_sessions()
 
     @staticmethod
     def _is_admissible(
@@ -1014,66 +1105,6 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 # Engine became unavailable: trigger ENGINE_DELETED
                 self._delete_engine(engine_name)
 
-    def get_endpoint_info(self) -> List[EndpointInfo]:
-        """
-        Get the URLs of the serving engines that are available for
-        querying.
-
-        Returns:
-            a list of engine URLs
-        """
-        with self.available_engines_lock:
-            return list(self.available_engines.values())
-
-    def get_health(self) -> bool:
-        """
-        Check if the service discovery module is healthy.
-
-        Returns:
-            True if the service discovery module is healthy, False otherwise
-        """
-        return self.watcher_thread.is_alive()
-
-    def close(self):
-        """
-        Close the service discovery module.
-        """
-        self.running = False
-        self.k8s_watcher.stop()
-        self.watcher_thread.join()
-
-    async def initialize_client_sessions(self) -> None:
-        """
-        Initialize aiohttp ClientSession objects for prefill and decode endpoints.
-        This must be called from an async context during app startup.
-        """
-        if (
-            self.prefill_model_labels is not None
-            and self.decode_model_labels is not None
-        ):
-            endpoint_infos = self.get_endpoint_info()
-            for endpoint_info in endpoint_infos:
-                if endpoint_info.model_label in self.prefill_model_labels:
-                    if (
-                        hasattr(self.app.state, "prefill_client")
-                        and self.app.state.prefill_client is not None
-                    ):
-                        await self.app.state.prefill_client.close()
-                    self.app.state.prefill_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
-                elif endpoint_info.model_label in self.decode_model_labels:
-                    if (
-                        hasattr(self.app.state, "decode_client")
-                        and self.app.state.decode_client is not None
-                    ):
-                        await self.app.state.decode_client.close()
-                    self.app.state.decode_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
-
     def has_ever_seen_model(self, model_name: str) -> bool:
         """Check if we've ever seen this model, even if currently scaled to zero."""
         with self.known_models_lock:
@@ -1085,7 +1116,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return self.known_models.copy()
 
 
-class K8sServiceNameServiceDiscovery(ServiceDiscovery):
+class K8sServiceNameServiceDiscovery(_KubernetesDiscovery, ServiceDiscovery):
     def __init__(
         self,
         app,
@@ -1143,17 +1174,14 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
             config.load_kube_config()
 
         self.k8s_api = client.CoreV1Api()
-        self.k8s_watcher = watch.Watch()
-
-        # Start watching engines
-        self.running = True
-        self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
-        self.watcher_thread.start()
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
+        self._init_watcher(self.k8s_api.list_namespaced_service, "V1Service")
 
     def _check_service_ready(self, service_name, namespace):
-        endpoints = self.k8s_api.read_namespaced_endpoints(service_name, namespace)
+        endpoints = self.k8s_api.read_namespaced_endpoints(
+            service_name, namespace, _request_timeout=(3, 10)
+        )
         if not endpoints.subsets:
             return False
 
@@ -1193,13 +1221,17 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
 
     def _check_engine_sleep_mode(self, service_name) -> Optional[bool]:
         try:
-            service = self.k8s_api.read_namespaced_service(service_name, self.namespace)
+            service = self.k8s_api.read_namespaced_service(
+                service_name, self.namespace, _request_timeout=(3, 10)
+            )
             if not service.spec.selector:
                 return False
 
             selector = ",".join([f"{k}={v}" for k, v in service.spec.selector.items()])
             pods = self.k8s_api.list_namespaced_pod(
-                namespace=self.namespace, label_selector=selector
+                namespace=self.namespace,
+                label_selector=selector,
+                _request_timeout=(3, 10),
             )
 
             if not pods.items:
@@ -1211,7 +1243,7 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
             enable_sleep_mode = False
             for container in pods.items[0].spec.containers:
                 if container.name == "vllm":
-                    for arg in container.command:
+                    for arg in container.command or []:
                         if arg == "--enable-sleep-mode":
                             enable_sleep_mode = True
                             break
@@ -1339,43 +1371,55 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
             return None
         return service.spec.selector.get("model")
 
-    def _watch_engines(self):
-        while self.running:
-            try:
-                for event in self.k8s_watcher.stream(
-                    self.k8s_api.list_namespaced_service,
-                    namespace=self.namespace,
-                    label_selector=self.label_selector,
-                    timeout_seconds=self.watcher_timeout_seconds,
-                ):
-                    service = event["object"]
-                    event_type = event["type"]
-                    if event_type == "DELETED":
-                        if service.metadata.name in self.available_engines:
-                            self._delete_engine(service.metadata.name)
-                        continue
-                    service_name = service.metadata.name
-                    is_service_ready = self._check_service_ready(
-                        service_name, self.namespace
-                    )
-                    if is_service_ready:
-                        model_names = self._get_model_names(service_name)
-                        model_label = self._get_model_label(service)
-                    else:
-                        model_names = []
-                        model_label = None
-                    self._on_engine_update(
-                        service_name,
-                        event_type,
-                        is_service_ready,
-                        model_names,
-                        model_label,
-                    )
-            except Exception as e:
-                logger.error(f"K8s watcher error: {e}")
-                time.sleep(0.5)
+    def _handle_resource(self, service, event_type):
+        name = service.metadata.name
+        uid = service.metadata.uid
+        with self.available_engines_lock:
+            old = self.available_engines.get(name)
+        if event_type == "DELETED":
+            if old is not None and (
+                old.resource_uid is None or old.resource_uid == uid
+            ):
+                self._delete_engine(name)
+            return
+        # Invalidate a replacement before any readiness/probe call can fail.
+        if old is not None and old.resource_uid != uid:
+            self._delete_engine(name)
+        if (
+            service.metadata.deletion_timestamp is not None
+            or not self._check_service_ready(name, self.namespace)
+        ):
+            self._delete_engine(name)
+            return
+        labels = service.metadata.labels or {}
+        signature = (
+            uid,
+            tuple(sorted(labels.items())),
+            tuple(sorted((service.spec.selector or {}).items())),
+            (service.metadata.annotations or {}).get("lora-modified"),
+        )
+        if old is not None and old.resource_signature == signature:
+            return
+        models = self._get_model_names(name)
+        if models and self.running:
+            if old is not None:
+                self._delete_engine(name)
+            self._add_engine(
+                name,
+                models,
+                self._get_model_label(service),
+                resource_uid=uid,
+                resource_signature=signature,
+            )
 
-    def _add_engine(self, engine_name: str, model_names: List[str], model_label: str):
+    def _add_engine(
+        self,
+        engine_name: str,
+        model_names: List[str],
+        model_label: str,
+        resource_uid=None,
+        resource_signature=None,
+    ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
             f"running models: {model_names}"
@@ -1390,6 +1434,9 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
         else:
             sleep_status = False
 
+        if not self.running:
+            return
+
         with self.available_engines_lock:
             self.available_engines[engine_name] = EndpointInfo(
                 url=f"http://{engine_name}:{self.port}",
@@ -1401,15 +1448,20 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
                 service_name=engine_name,
                 namespace=self.namespace,
                 model_info=model_info,
+                resource_uid=resource_uid,
+                resource_signature=resource_signature,
             )
 
             # Store model information in the endpoint info
             self.available_engines[engine_name].model_info = model_info
 
+        self._schedule_sessions()
+
     def _delete_engine(self, engine_name: str):
-        logger.info(f"Serving engine {engine_name} is deleted")
         with self.available_engines_lock:
-            del self.available_engines[engine_name]
+            removed = self.available_engines.pop(engine_name, None)
+        if removed is not None:
+            self._schedule_sessions()
 
     def _on_engine_update(
         self,
@@ -1450,56 +1502,6 @@ class K8sServiceNameServiceDiscovery(ServiceDiscovery):
             ) and engine_name in self.available_engines:
                 self._delete_engine(engine_name)
                 return
-
-    def get_endpoint_info(self) -> List[EndpointInfo]:
-        """
-        Get the URLs of the serving engines that are available for
-        querying.
-
-        Returns:
-            a list of engine URLs
-        """
-        with self.available_engines_lock:
-            return list(self.available_engines.values())
-
-    def get_health(self) -> bool:
-        """
-        Check if the service discovery module is healthy.
-
-        Returns:
-            True if the service discovery module is healthy, False otherwise
-        """
-        return self.watcher_thread.is_alive()
-
-    def close(self):
-        """
-        Close the service discovery module.
-        """
-        self.running = False
-        self.k8s_watcher.stop()
-        self.watcher_thread.join()
-
-    async def initialize_client_sessions(self) -> None:
-        """
-        Initialize aiohttp ClientSession objects for prefill and decode endpoints.
-        This must be called from an async context during app startup.
-        """
-        if (
-            self.prefill_model_labels is not None
-            and self.decode_model_labels is not None
-        ):
-            endpoint_infos = self.get_endpoint_info()
-            for endpoint_info in endpoint_infos:
-                if endpoint_info.model_label in self.prefill_model_labels:
-                    self.app.state.prefill_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
-                elif endpoint_info.model_label in self.decode_model_labels:
-                    self.app.state.decode_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
 
 
 def _create_service_discovery(

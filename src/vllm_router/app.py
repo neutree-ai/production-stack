@@ -88,37 +88,41 @@ logger = logging.getLogger("uvicorn")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The discovery watcher may need to schedule P/D clients as soon as it starts.
+    loop = asyncio.get_running_loop()
+    app.state.event_loop = loop
     app.state.aiohttp_client_wrapper.start()
     if hasattr(app.state, "batch_processor"):
         await app.state.batch_processor.initialize()
 
     service_discovery = get_service_discovery()
+    if hasattr(service_discovery, "set_event_loop"):
+        service_discovery.set_event_loop(loop)
     if hasattr(service_discovery, "initialize_client_sessions"):
         await service_discovery.initialize_client_sessions()
 
-    app.state.event_loop = asyncio.get_event_loop()
+    try:
+        yield
+    finally:
 
-    yield
-    await app.state.aiohttp_client_wrapper.stop()
+        # Keep the loop running until background discovery can no longer schedule work.
+        dyn_cfg_watcher = get_dynamic_config_watcher()
+        if dyn_cfg_watcher is not None:
+            await asyncio.to_thread(dyn_cfg_watcher.close)
+        service_discovery = get_service_discovery()
+        await asyncio.to_thread(service_discovery.close)
+        if hasattr(service_discovery, "close_client_sessions"):
+            await service_discovery.close_client_sessions()
+        await app.state.aiohttp_client_wrapper.stop()
 
-    # Close the threaded-components
-    logger.info("Closing engine stats scraper")
-    if app.state.engine_stats_scraper is not None:
-        app.state.engine_stats_scraper.close()
+        # Close the threaded-components
+        logger.info("Closing engine stats scraper")
+        if app.state.engine_stats_scraper is not None:
+            await asyncio.to_thread(app.state.engine_stats_scraper.close)
 
-    logger.info("Closing service discovery module")
-    service_discovery = get_service_discovery()
-    service_discovery.close()
-
-    # Close the optional dynamic config watcher
-    dyn_cfg_watcher = get_dynamic_config_watcher()
-    if dyn_cfg_watcher is not None:
-        logger.info("Closing dynamic config watcher")
-        dyn_cfg_watcher.close()
-
-    # Close routing logic instances
-    logger.info("Closing routing logic instances")
-    cleanup_routing_logic()
+        # Close routing logic instances
+        logger.info("Closing routing logic instances")
+        cleanup_routing_logic()
 
 
 def initialize_all(app: FastAPI, args):
