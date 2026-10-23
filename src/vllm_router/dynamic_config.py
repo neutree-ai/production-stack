@@ -20,6 +20,7 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI
 
+from vllm_router.backend_http import BackendHttpConfig
 from vllm_router.log import init_logger
 from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
@@ -63,6 +64,16 @@ class DynamicRouterConfig:
     k8s_namespace: Optional[str] = None
     k8s_label_selector: Optional[str] = None
 
+    max_connections_per_backend: int = 100
+    pool_wait_timeout_seconds: float = 60
+    connect_timeout_seconds: float = 10
+    response_header_timeout_seconds: float = 0
+    response_read_timeout_seconds: float = 600
+    stream_idle_timeout_seconds: float = 600
+
+    def __post_init__(self):
+        BackendHttpConfig.from_args(self)
+
     # Routing logic configurations
     session_key: Optional[str] = None
 
@@ -99,6 +110,7 @@ class DynamicRouterConfig:
             session_key=args.session_key,
             # Logging Options
             callbacks=args.callbacks,
+            **BackendHttpConfig.from_args(args).__dict__,
         )
 
     @staticmethod
@@ -233,6 +245,10 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         """
         Reconfigures the router with the given config.
         """
+        # Check before mutating discovery: changed transport fields require a rollout.
+        self.app.state.aiohttp_client_wrapper.configure(
+            BackendHttpConfig.from_args(config)
+        )
         self.reconfigure_service_discovery(config)
         self.reconfigure_routing_logic(config)
         self.reconfigure_batch_api(config)

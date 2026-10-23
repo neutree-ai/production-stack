@@ -21,6 +21,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from vllm_router.aiohttp_client import AiohttpClientWrapper
+from vllm_router.backend_http import BackendHttpConfig
 from vllm_router.dynamic_config import (
     DynamicRouterConfig,
     get_dynamic_config_watcher,
@@ -131,6 +132,8 @@ def initialize_all(app: FastAPI, args):
     Raises:
         ValueError: if the service discovery type is invalid
     """
+    app.state.aiohttp_client_wrapper.configure(BackendHttpConfig.from_args(args))
+
     if sentry_dsn := args.sentry_dsn:
         sentry_sdk.init(
             dsn=sentry_dsn,

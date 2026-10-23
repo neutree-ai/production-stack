@@ -15,8 +15,10 @@ import argparse
 import json
 import logging
 import sys
+from dataclasses import fields
 
 from vllm_router import utils
+from vllm_router.backend_http import BackendHttpConfig
 from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
 )
@@ -55,6 +57,13 @@ def load_initial_config_from_config_file_if_required(
             f"Initial loading of dynamic YAML config file at {dynamic_config_yaml}"
         )
         yaml_config = read_and_process_yaml_config_file(dynamic_config_yaml)
+        BackendHttpConfig(
+            **{
+                name: value
+                for name, value in yaml_config.items()
+                if name in BackendHttpConfig.__dataclass_fields__
+            }
+        )
         parser.set_defaults(**yaml_config)
         args = parser.parse_args()
     elif dynamic_config_json:
@@ -62,7 +71,15 @@ def load_initial_config_from_config_file_if_required(
             f"Initial loading of dynamic JSON config file at {dynamic_config_json}"
         )
         with open(dynamic_config_json, encoding="utf-8") as f:
-            parser.set_defaults(**json.load(f))
+            json_config = json.load(f)
+            BackendHttpConfig(
+                **{
+                    name: value
+                    for name, value in json_config.items()
+                    if name in BackendHttpConfig.__dataclass_fields__
+                }
+            )
+            parser.set_defaults(**json_config)
             args = parser.parse_args()
 
     return args
@@ -83,6 +100,7 @@ def validate_static_model_types(model_types: str | None) -> None:
 
 # --- Argument Parsing and Initialization ---
 def validate_args(args):
+    BackendHttpConfig.from_args(args)
     verify_required_args_provided(args)
     if args.service_discovery == "static":
         if args.static_backends is None:
@@ -295,6 +313,19 @@ def parse_args():
         default=10,
         help="The interval in seconds to log statistics.",
     )
+
+    backend_group = parser.add_argument_group("Backend HTTP")
+    for field in fields(BackendHttpConfig):
+        backend_group.add_argument(
+            "--" + field.name.replace("_", "-"),
+            type=int if field.name == "max_connections_per_backend" else float,
+            default=field.default,
+            help=(
+                "Per-backend connection cap, 0 disables; maximum 65535."
+                if field.name == "max_connections_per_backend"
+                else "Phase timeout in seconds, 0 disables; maximum 604800. No total request limit."
+            ),
+        )
 
     # Config files
     group = parser.add_argument_group(
