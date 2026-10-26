@@ -91,11 +91,13 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "batch_processor"):
         await app.state.batch_processor.initialize()
 
+    loop = asyncio.get_running_loop()
+    app.state.event_loop = loop
     service_discovery = get_service_discovery()
+    if hasattr(service_discovery, "set_event_loop"):
+        service_discovery.set_event_loop(loop)
     if hasattr(service_discovery, "initialize_client_sessions"):
         await service_discovery.initialize_client_sessions()
-
-    app.state.event_loop = asyncio.get_event_loop()
 
     yield
     await app.state.aiohttp_client_wrapper.stop()
