@@ -129,7 +129,8 @@ async def test_disconnect_before_headers_cancels_backend_and_releases_stats(stat
     await asyncio.wait_for(context.entered.wait(), 1)
     disconnect.set()
     try:
-        response = await asyncio.wait_for(task, 0.2)
+        # Bound hangs without timing AnyIO's first backend import as request latency.
+        response = await asyncio.wait_for(task, 5)
     finally:
         if not task.done():
             task.cancel()
