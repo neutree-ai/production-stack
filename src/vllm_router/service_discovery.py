@@ -459,12 +459,42 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         self.k8s_api = client.CoreV1Api()
         self.k8s_watcher = watch.Watch()
 
+        # Upstream #768: initialize fields before the watcher can discover a Pod.
+        self.prefill_model_labels = prefill_model_labels
+        self.decode_model_labels = decode_model_labels
+        self.event_loop = None
+        self.event_loop_ready = threading.Event()
+        self._client_session_lock = asyncio.Lock()
+
         # Start watching engines
         self.running = True
         self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
         self.watcher_thread.start()
-        self.prefill_model_labels = prefill_model_labels
-        self.decode_model_labels = decode_model_labels
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.event_loop = loop
+        self.event_loop_ready.set()
+        self._schedule_client_sessions()
+
+    def _schedule_client_sessions(self) -> None:
+        if not self.event_loop_ready.is_set() or self.event_loop is None:
+            return
+        coroutine = self.initialize_client_sessions()
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self.event_loop)
+        except Exception:
+            coroutine.close()
+            logger.exception("Failed to schedule client session initialization")
+            return
+
+        # Report failures without blocking the watcher on the application loop.
+        def completed(result):
+            try:
+                result.result()
+            except Exception:
+                logger.exception("Error initializing client sessions")
+
+        future.add_done_callback(completed)
 
     def _trigger_callbacks(
         self,
@@ -884,14 +914,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             endpoint_info,
         )
 
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self.initialize_client_sessions(),
-                self.app.state.event_loop,
-            )
-            fut.result()
-        except Exception as e:
-            logger.error(f"Error initializing client sessions: {e}")
+        self._schedule_client_sessions()
 
         # Track all models we've ever seen
         with self.known_models_lock:
@@ -1047,32 +1070,33 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         Initialize aiohttp ClientSession objects for prefill and decode endpoints.
         This must be called from an async context during app startup.
         """
-        if (
-            self.prefill_model_labels is not None
-            and self.decode_model_labels is not None
-        ):
-            endpoint_infos = self.get_endpoint_info()
-            for endpoint_info in endpoint_infos:
-                if endpoint_info.model_label in self.prefill_model_labels:
-                    if (
-                        hasattr(self.app.state, "prefill_client")
-                        and self.app.state.prefill_client is not None
-                    ):
-                        await self.app.state.prefill_client.close()
-                    self.app.state.prefill_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
-                elif endpoint_info.model_label in self.decode_model_labels:
-                    if (
-                        hasattr(self.app.state, "decode_client")
-                        and self.app.state.decode_client is not None
-                    ):
-                        await self.app.state.decode_client.close()
-                    self.app.state.decode_client = aiohttp.ClientSession(
-                        base_url=endpoint_info.url,
-                        timeout=aiohttp.ClientTimeout(total=None),
-                    )
+        async with self._client_session_lock:
+            if (
+                self.prefill_model_labels is not None
+                and self.decode_model_labels is not None
+            ):
+                endpoint_infos = self.get_endpoint_info()
+                for endpoint_info in endpoint_infos:
+                    if endpoint_info.model_label in self.prefill_model_labels:
+                        if (
+                            hasattr(self.app.state, "prefill_client")
+                            and self.app.state.prefill_client is not None
+                        ):
+                            await self.app.state.prefill_client.close()
+                        self.app.state.prefill_client = aiohttp.ClientSession(
+                            base_url=endpoint_info.url,
+                            timeout=aiohttp.ClientTimeout(total=None),
+                        )
+                    elif endpoint_info.model_label in self.decode_model_labels:
+                        if (
+                            hasattr(self.app.state, "decode_client")
+                            and self.app.state.decode_client is not None
+                        ):
+                            await self.app.state.decode_client.close()
+                        self.app.state.decode_client = aiohttp.ClientSession(
+                            base_url=endpoint_info.url,
+                            timeout=aiohttp.ClientTimeout(total=None),
+                        )
 
     def has_ever_seen_model(self, model_name: str) -> bool:
         """Check if we've ever seen this model, even if currently scaled to zero."""
