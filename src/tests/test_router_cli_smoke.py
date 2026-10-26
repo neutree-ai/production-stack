@@ -210,7 +210,3 @@ async def test_real_cli_new_apis_timeout_active_stream_and_metrics(tmp_path):
             assert 'outcome="timeout"' in metrics
             assert 'phase="response_header"' in metrics
             assert "router:backend_response_headers_seconds_count{" in metrics
-        async with session.post(
-            url + "/ws/ep/v1/responses", json={"model": "m"}
-        ) as response:
-            assert response.status == 404

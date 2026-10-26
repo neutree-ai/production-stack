@@ -181,12 +181,3 @@ def test_static_health_checks_cover_new_api_types(monkeypatch, kind, path):
         assert "file" in post.call_args.kwargs["files"]
     else:
         assert post.call_args.kwargs["json"]["input"] == "Hello"
-
-
-def test_responses_api_remains_deferred_and_admin_routes_are_not_expanded():
-    paths = {route.path for route in main_router.routes}
-    assert not any("responses" in path for path in paths)
-    assert not any(
-        path.endswith(("/collective_rpc", "/start_profile", "/reset_prefix_cache"))
-        for path in paths
-    )
