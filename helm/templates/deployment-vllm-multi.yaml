@@ -98,9 +98,9 @@ spec:
       {{- if hasKey $modelSpec "serviceAccountName" }}
       serviceAccountName: {{ $modelSpec.serviceAccountName }}
       {{- end }}
+      hostPID: true
       {{- if and (hasKey $modelSpec "lmcacheConfig") (hasKey $modelSpec.lmcacheConfig "enablePD") ($modelSpec.lmcacheConfig.enablePD) }}
       hostIPC: true
-      hostPID: true
       {{- end }}
       hostname: "{{ $.Release.Name }}-{{ $modelSpec.name }}-{{ $.Chart.Name }}"
       subdomain: "{{ $.Release.Name }}-{{ $modelSpec.name }}-engine-service"
