@@ -15,12 +15,13 @@
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Optional
 
 from fastapi import FastAPI
 
 from vllm_router.log import init_logger
+from vllm_router.parsers.parser import CLIENT_CONFIG_DEFAULTS, normalize_client_config
 from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
 )
@@ -69,6 +70,16 @@ class DynamicRouterConfig:
     # Logging Options
     callbacks: Optional[str] = None
 
+    # Native client settings are loaded at startup and require a restart to change.
+    max_connections_per_backend: int = 100
+    connect_timeout_seconds: float = 60
+    sock_connect_timeout_seconds: float = 10
+    sock_read_timeout_seconds: float = 600
+
+    def __post_init__(self):
+        for name, value in normalize_client_config(vars(self)).items():
+            setattr(self, name, value)
+
     # Batch API configurations
     # TODO (ApostaC): Support dynamic reconfiguration of batch API
     # enable_batch_api: bool
@@ -99,6 +110,7 @@ class DynamicRouterConfig:
             session_key=args.session_key,
             # Logging Options
             callbacks=args.callbacks,
+            **normalize_client_config(vars(args)),
         )
 
     @staticmethod
@@ -143,6 +155,10 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         self.watch_interval = watch_interval
         self.current_config = init_config
         self.app = app
+        # Compare file edits with the file, while retaining effective CLI overrides.
+        self._initial_file_client_config = tuple(
+            normalize_client_config(self._load_config()).items()
+        )
 
         # Watcher thread
         self.running = True
@@ -152,6 +168,14 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
 
     def get_current_config(self) -> DynamicRouterConfig:
         return self.current_config
+
+    def _load_config(self) -> dict:
+        if self.config_file_type == "YAML":
+            return read_and_process_yaml_config_file(self.config_path)
+        if self.config_file_type == "JSON":
+            with open(self.config_path, encoding="utf-8") as config_file:
+                return json.load(config_file)
+        raise ValueError("Unsupported config file type.")
 
     def reconfigure_service_discovery(self, config: DynamicRouterConfig):
         """
@@ -233,6 +257,16 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         """
         Reconfigures the router with the given config.
         """
+        changed_client_settings = [
+            name
+            for name in CLIENT_CONFIG_DEFAULTS
+            if getattr(config, name) != getattr(self.current_config, name)
+        ]
+        if changed_client_settings:
+            raise ValueError(
+                "Client settings require a router restart: "
+                + ", ".join(changed_client_settings)
+            )
         self.reconfigure_service_discovery(config)
         self.reconfigure_routing_logic(config)
         self.reconfigure_batch_api(config)
@@ -257,12 +291,20 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         """
         while self.running:
             try:
-                if self.config_file_type == "YAML":
-                    config = DynamicRouterConfig.from_yaml(self.config_path)
-                elif self.config_file_type == "JSON":
-                    config = DynamicRouterConfig.from_json(self.config_path)
-                else:
-                    raise ValueError("Unsupported config file type.")
+                config = DynamicRouterConfig(**self._load_config())
+                changed_client_settings = [
+                    name
+                    for name, initial_value in self._initial_file_client_config
+                    if getattr(config, name) != initial_value
+                ]
+                if changed_client_settings:
+                    raise ValueError(
+                        "Client settings require a router restart: "
+                        + ", ".join(changed_client_settings)
+                    )
+                config = replace(
+                    config, **normalize_client_config(vars(self.current_config))
+                )
                 if config != self.current_config:
                     logger.info(
                         "DynamicConfigWatcher: Config changed, reconfiguring..."

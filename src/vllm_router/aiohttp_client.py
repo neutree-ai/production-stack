@@ -22,12 +22,20 @@ class AiohttpClientWrapper:
 
     async_client = None
 
-    def start(self):
+    def start(self, *, timeout=None, max_connections_per_backend=100, trace_configs=()):
         """Instantiate the client. Call from the FastAPI startup hook."""
         # Allow total concurrency to scale across backends while keeping each
         # backend connection pool bounded.
-        connector = aiohttp.TCPConnector(limit=0, limit_per_host=100)
-        self.async_client = aiohttp.ClientSession(connector=connector)
+        connector = aiohttp.TCPConnector(
+            limit=0, limit_per_host=max_connections_per_backend
+        )
+        self.async_client = aiohttp.ClientSession(
+            connector=connector,
+            timeout=(
+                timeout if timeout is not None else aiohttp.ClientTimeout(total=None)
+            ),
+            trace_configs=trace_configs,
+        )
         logger.info(f"aiohttp ClientSession instantiated. Id {id(self.async_client)}")
 
     async def stop(self):

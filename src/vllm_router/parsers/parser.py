@@ -14,6 +14,7 @@
 import argparse
 import json
 import logging
+import math
 import sys
 
 from vllm_router import utils
@@ -33,6 +34,31 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+CLIENT_CONFIG_DEFAULTS = {
+    "max_connections_per_backend": 100,
+    "connect_timeout_seconds": 60,
+    "sock_connect_timeout_seconds": 10,
+    "sock_read_timeout_seconds": 600,
+}
+
+
+def normalize_client_config(config: dict) -> dict:
+    values = {}
+    for name, default in CLIENT_CONFIG_DEFAULTS.items():
+        value = config.get(name)
+        if value is None:
+            value = default
+        connection_limit = name == "max_connections_per_backend"
+        maximum = 65535 if connection_limit else 604800
+        valid_type = (
+            type(value) is int if connection_limit else type(value) in (int, float)
+        )
+        if not valid_type or not 0 <= value <= maximum or not math.isfinite(value):
+            kind = "an integer" if connection_limit else "a finite number"
+            raise ValueError(f"{name} must be {kind} between 0 and {maximum}")
+        values[name] = value
+    return values
 
 
 def verify_required_args_provided(args: argparse.Namespace) -> None:
@@ -55,6 +81,7 @@ def load_initial_config_from_config_file_if_required(
             f"Initial loading of dynamic YAML config file at {dynamic_config_yaml}"
         )
         yaml_config = read_and_process_yaml_config_file(dynamic_config_yaml)
+        yaml_config = {**yaml_config, **normalize_client_config(yaml_config)}
         parser.set_defaults(**yaml_config)
         args = parser.parse_args()
     elif dynamic_config_json:
@@ -62,7 +89,8 @@ def load_initial_config_from_config_file_if_required(
             f"Initial loading of dynamic JSON config file at {dynamic_config_json}"
         )
         with open(dynamic_config_json, encoding="utf-8") as f:
-            parser.set_defaults(**json.load(f))
+            config = json.load(f)
+            parser.set_defaults(**{**config, **normalize_client_config(config)})
             args = parser.parse_args()
 
     return args
@@ -113,6 +141,7 @@ def validate_args(args):
         raise ValueError(
             "Sentry profile session sample rate must be between 0.0 and 1.0."
         )
+    vars(args).update(normalize_client_config(vars(args)))
 
 
 def parse_args():
@@ -200,6 +229,23 @@ def parse_args():
         default=10,
         help="Timeout in seconds for backend health check requests (default: 10).",
     )
+    parser.add_argument(
+        "--max-connections-per-backend",
+        type=int,
+        default=CLIENT_CONFIG_DEFAULTS["max_connections_per_backend"],
+        help="Maximum connections per backend; 0 disables the limit (default: 100).",
+    )
+    for name, description in (
+        ("connect_timeout_seconds", "Connection acquisition, including pool waiting"),
+        ("sock_connect_timeout_seconds", "New socket connection"),
+        ("sock_read_timeout_seconds", "Idle read, including response headers and body"),
+    ):
+        parser.add_argument(
+            f"--{name.replace('_', '-')}",
+            type=float,
+            default=CLIENT_CONFIG_DEFAULTS[name],
+            help=f"{description} timeout in seconds; 0 disables it (default: {CLIENT_CONFIG_DEFAULTS[name]}).",
+        )
     parser.add_argument(
         "--routing-logic",
         type=str,
