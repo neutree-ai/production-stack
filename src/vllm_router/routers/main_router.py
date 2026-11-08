@@ -27,6 +27,7 @@ from vllm_router.service_discovery import get_service_discovery
 from vllm_router.services.request_service.request import (
     route_general_request,
     route_general_transcriptions,
+    route_multipart_request,
     route_sleep_wakeup_request,
 )
 from vllm_router.stats.engine_stats import get_engine_stats_scraper
@@ -93,6 +94,43 @@ async def route_embeddings(
         background_tasks,
         workspace,
         endpoint,
+    )
+
+
+# Adapted from upstream #1112 with Neutree's scoped route prefix.
+@main_router.post("/{workspace}/{endpoint}/pooling")
+async def route_pooling(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/pooling", background_tasks, workspace, endpoint
+    )
+
+
+@main_router.post("/{workspace}/{endpoint}/classify")
+async def route_classification(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_request(
+        request, "/classify", background_tasks, workspace, endpoint
+    )
+
+
+@main_router.post("/{workspace}/{endpoint}/v1/audio/translations")
+async def route_audio_translations(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_multipart_request(
+        request, "/v1/audio/translations", background_tasks, workspace, endpoint
+    )
+
+
+@main_router.post("/{workspace}/{endpoint}/v1/audio/transcriptions")
+async def route_scoped_audio_transcriptions(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
+    return await route_general_transcriptions(
+        request, "/v1/audio/transcriptions", background_tasks, workspace, endpoint
     )
 
 

@@ -38,10 +38,41 @@ The router can be configured using command-line arguments. Below are the availab
 - `--routing-logic`: The routing logic to use. Options are `roundrobin` or `session`. This option is required.
 - `--session-key`: The key (in the header) to identify a session.
 
+### Backend HTTP Options
+
+These options configure the existing aiohttp client at startup. The JSON/YAML
+field names use underscores in place of the CLI hyphens.
+
+| CLI option | Default | Meaning |
+| --- | --- | --- |
+| `--max-connections-per-backend` | `100` | Connection slots per host, per Router process; `0` is unlimited |
+| `--connect-timeout-seconds` | `60` | Connection acquisition, including pool waiting and establishing a connection |
+| `--sock-connect-timeout-seconds` | `10` | Socket connection establishment |
+| `--sock-read-timeout-seconds` | `600` | Idle wait for response headers or subsequent response data |
+
+There is no total request deadline. Continuous streaming may exceed these
+durations. Timeout values accept fractional seconds from `0` to `604800`, with
+`0` disabling that timeout. Connection limits are integers from `0` to `65535`.
+Omitted or null file values use defaults; changing these four fields requires
+a restart. Other supported dynamic settings remain reloadable.
+
+Kubernetes discovery performs a complete List before restarting its Watch and
+retries failures after five seconds. Existing cached backends continue serving
+new requests during an API server outage; a successful List removes deleted
+backends. A cached backend may fail requests until deletion is confirmed.
+
 ### Monitoring Options
 
 - `--engine-stats-interval`: The interval in seconds to scrape engine statistics. Default is `30`.
 - `--request-stats-window`: The sliding window seconds to compute request statistics. Default is `60`.
+
+`/metrics` also exports `router:connection_pool_waiting`, labelled by
+`workspace`, `endpoint`, and backend `server`. It counts calls waiting for an
+aiohttp connection slot, including cleanup on connection timeout or cancellation.
+It is separate from the inference engine's scheduler queue. Each Router has its
+own pool; preserve the Router instance when diagnosing sustained waiting.
+Thirty-second scrapes may miss brief waiting spikes. Backend labels absent from
+discovery and inactive for five minutes are removed once no calls are waiting.
 
 ### Logging Options
 
@@ -104,6 +135,27 @@ different endpoints for each model type.
 
 > Enabling this flag will put some load on your backend every minute as real requests are send to the nodes
 > to test their functionality.
+
+## Additional scoped inference APIs
+
+| POST path | Backend path | Body |
+| --- | --- | --- |
+| `/{workspace}/{endpoint}/pooling` | `/pooling` | JSON object with `model` and task input |
+| `/{workspace}/{endpoint}/classify` | `/classify` | JSON object with `model` and task input |
+| `/{workspace}/{endpoint}/v1/audio/transcriptions` | `/v1/audio/transcriptions` | Multipart `file` and `model` |
+| `/{workspace}/{endpoint}/v1/audio/translations` | `/v1/audio/translations` | Multipart `file` and `model` |
+
+All four paths select backends within the requested workspace and endpoint.
+The existing unscoped transcription path remains available. Transcription keeps
+the existing normalized core fields and forwards additional text fields,
+including repeated keys. Translation preserves the original multipart body.
+Audio responses preserve the backend status and JSON, text or streaming content
+type. Requests use the same native HTTP configuration as other inference calls.
+The backend engine must support the requested task; adding a Router path does
+not add an engine task or a global model-routing entry.
+
+Static health checks also accept the `pooling`, `classification` and
+`translation` model types.
 
 ## Dynamic Router Config
 
