@@ -169,7 +169,8 @@ async def test_cli_discovers_backend_and_serves_scoped_apis_with_native_pool_met
                 async with client.get(base + "/metrics") as response:
                     text = await response.text()
                 if (
-                    'router:connection_pool_waiting{endpoint="ep",server=' in text
+                    'router:connection_pool_waiting{endpoint="ep",replica="backend",server='
+                    in text
                     and ',workspace="ws"} 1.0' in text
                 ):
                     break

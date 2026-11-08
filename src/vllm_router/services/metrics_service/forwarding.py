@@ -11,13 +11,18 @@ logger = init_logger(__name__)
 connection_pool_waiting = Gauge(
     "router:connection_pool_waiting",
     "Backend HTTP calls waiting for a connection slot",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 _series = {}
 
 
-def trace_context(workspace, endpoint, server):
-    return {"workspace": workspace or "", "endpoint": endpoint or "", "server": server}
+def trace_context(workspace, endpoint, server, replica=""):
+    return {
+        "workspace": workspace or "",
+        "endpoint": endpoint or "",
+        "server": server,
+        "replica": replica or "",
+    }
 
 
 async def _request_started(session, context, params):
@@ -25,7 +30,12 @@ async def _request_started(session, context, params):
         return
     try:
         data = context.trace_request_ctx
-        context.queue_key = (data["workspace"], data["endpoint"], data["server"])
+        context.queue_key = (
+            data["workspace"],
+            data["endpoint"],
+            data["server"],
+            data["replica"],
+        )
         context.queued = False
         state = _series.setdefault(context.queue_key, [0, 0])
         state[0] = time.monotonic()
@@ -70,7 +80,10 @@ def create_trace_config():
 
 
 def prune_forwarding_metrics(endpoints, *, now=None):
-    current = {(ep.workspace or "", ep.endpoint or "", ep.url) for ep in endpoints}
+    current = {
+        (ep.workspace or "", ep.endpoint or "", ep.url, ep.pod_name or "")
+        for ep in endpoints
+    }
     now = time.monotonic() if now is None else now
     for key, (last_seen, waiting) in list(_series.items()):
         if waiting or key in current or now - last_seen < 300:
