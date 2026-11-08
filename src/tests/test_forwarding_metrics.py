@@ -1,5 +1,6 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -13,13 +14,19 @@ from vllm_router.services.metrics_service.forwarding import (
 )
 
 
-def waiting(server):
+def waiting(server, replica=""):
     return next(
         (
             sample.value
             for family in connection_pool_waiting.collect()
             for sample in family.samples
-            if sample.labels == {"workspace": "ws", "endpoint": "ep", "server": server}
+            if sample.labels
+            == {
+                "workspace": "ws",
+                "endpoint": "ep",
+                "server": server,
+                "replica": replica,
+            }
         ),
         None,
     )
@@ -27,7 +34,10 @@ def waiting(server):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_path", ["acquired", "cancelled", "timeout"])
-async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(exit_path):
+@pytest.mark.parametrize("replica", ["", "inference-0"])
+async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(
+    exit_path, replica
+):
     # Long inference responses hold the only connection while another call queues.
     release = asyncio.Event()
     queued = asyncio.Event()
@@ -59,15 +69,23 @@ async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(exi
             trace_configs=[trace],
         ) as client:
             first = await client.get(
-                server, trace_request_ctx=trace_context("ws", "ep", server)
+                server, trace_request_ctx=trace_context("ws", "ep", server, replica)
             )
             second = asyncio.create_task(
-                client.get(server, trace_request_ctx=trace_context("ws", "ep", server))
+                client.get(
+                    server,
+                    trace_request_ctx=trace_context("ws", "ep", server, replica),
+                )
             )
             await asyncio.wait_for(queued.wait(), 2)
-            assert waiting(server) == 1
-            prune_forwarding_metrics([], now=time.monotonic() + 301)
-            assert waiting(server) == 1
+            assert waiting(server, replica) == 1
+            # Discovery can replace a Pod at the same URL while an old call waits.
+            replacement = SimpleNamespace(
+                workspace="ws", endpoint="ep", url=server, pod_name="replacement"
+            )
+            prune_forwarding_metrics([replacement], now=time.monotonic() + 301)
+            assert waiting(server, replica) == 1
+            assert waiting(server, "replacement") is None
             if exit_path == "acquired":
                 release.set()
                 assert await first.read() == b"result"
@@ -80,14 +98,21 @@ async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(exi
             else:
                 with pytest.raises(aiohttp.ConnectionTimeoutError):
                     await second
-            assert waiting(server) == 0
+            assert waiting(server, replica) == 0
             release.set()
             await first.read()
-            prune_forwarding_metrics([], now=time.monotonic() + 301)
-            assert waiting(server) is None
+            prune_forwarding_metrics([replacement], now=time.monotonic() + 301)
+            assert waiting(server, replica) is None
+            response = await client.get(
+                server,
+                trace_request_ctx=trace_context("ws", "ep", server, "replacement"),
+            )
+            await response.read()
+            prune_forwarding_metrics([replacement], now=time.monotonic() + 301)
+            assert waiting(server, "replacement") == 0
             response = await client.get(server)
             await response.read()
-            assert waiting(server) is None
+            assert waiting(server, replica) is None
     finally:
         release.set()
         await runner.cleanup()

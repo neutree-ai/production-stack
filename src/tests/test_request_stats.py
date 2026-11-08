@@ -292,7 +292,12 @@ def test_backend_error_releases_stats_and_logs_safe_terminal_fields(
 
 def test_clear_endpoint_metrics_removes_stale_labels_without_resetting_counter():
     clear_endpoint_metrics()
-    labels = {"workspace": "workspace", "endpoint": "endpoint", "server": "stale"}
+    labels = {
+        "workspace": "workspace",
+        "endpoint": "endpoint",
+        "server": "stale",
+        "replica": "inference-0",
+    }
     current_qps.labels(**labels).set(1)
     num_requests_waiting.labels(**labels).set(2)
     num_incoming_requests_total.labels(workspace="workspace", endpoint="endpoint").inc()
@@ -304,13 +309,22 @@ def test_clear_endpoint_metrics_removes_stale_labels_without_resetting_counter()
     assert num_incoming_requests_total._metrics
 
 
-def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch):
+@pytest.mark.parametrize("pod_name", [None, "inference-0"])
+def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch, pod_name):
     metrics_module = importlib.import_module("vllm_router.routers.metrics_router")
     old_endpoint = SimpleNamespace(
-        url="http://stale", workspace="workspace", endpoint="endpoint", healthy=True
+        url="http://stale",
+        workspace="workspace",
+        endpoint="endpoint",
+        healthy=True,
+        pod_name=pod_name,
     )
     current_endpoint = SimpleNamespace(
-        url="http://current", workspace="workspace", endpoint="endpoint", healthy=True
+        url="http://current",
+        workspace="workspace",
+        endpoint="endpoint",
+        healthy=True,
+        pod_name=pod_name,
     )
     endpoints = [old_endpoint]
     request_stat = SimpleNamespace(
@@ -331,7 +345,18 @@ def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch):
 
     monkeypatch.setattr(metrics_module, "get_service_discovery", lambda: discovery)
     monkeypatch.setattr(metrics_module, "get_request_stats_monitor", lambda: monitor)
-    monkeypatch.setattr(metrics_module, "get_engine_stats_scraper", lambda: None)
+    engine_stats = SimpleNamespace(
+        gpu_prefix_cache_hit_rate=0.5,
+        gpu_prefix_cache_hits_total=10,
+        gpu_prefix_cache_queries_total=20,
+    )
+    monkeypatch.setattr(
+        metrics_module,
+        "get_engine_stats_scraper",
+        lambda: SimpleNamespace(
+            engine_stats={endpoint.url: engine_stats for endpoint in endpoints}
+        ),
+    )
     monkeypatch.setattr(metrics_module.psutil, "cpu_percent", lambda interval: 0)
     monkeypatch.setattr(
         metrics_module.psutil, "virtual_memory", lambda: SimpleNamespace(percent=0)
@@ -340,9 +365,82 @@ def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch):
         metrics_module.psutil, "disk_usage", lambda _: SimpleNamespace(percent=0)
     )
 
-    asyncio.run(metrics_module.metrics())
+    response = asyncio.run(metrics_module.metrics())
+
+    assert f'replica="{pod_name or ""}"' in response.body.decode()
     endpoints[:] = [current_endpoint]
     asyncio.run(metrics_module.metrics())
 
-    assert ("workspace", "endpoint", "http://stale") not in current_qps._metrics
-    assert ("workspace", "endpoint", "http://current") in current_qps._metrics
+    assert (
+        "workspace",
+        "endpoint",
+        "http://stale",
+        pod_name or "",
+    ) not in current_qps._metrics
+    assert (
+        "workspace",
+        "endpoint",
+        "http://current",
+        pod_name or "",
+    ) in current_qps._metrics
+
+
+def test_log_stats_exports_inference_replica_labels(monkeypatch):
+    log_module = importlib.import_module("vllm_router.stats.log_stats")
+    endpoint = SimpleNamespace(
+        url="http://logged",
+        workspace="workspace",
+        endpoint="endpoint",
+        pod_name="inference-0",
+        model_info={},
+    )
+    engine_stats = SimpleNamespace(
+        num_running_requests=1,
+        num_queuing_requests=0,
+        gpu_prefix_cache_hit_rate=0.5,
+        gpu_prefix_cache_hits_total=10,
+        gpu_prefix_cache_queries_total=20,
+    )
+    request_stats = SimpleNamespace(
+        qps=1,
+        avg_decoding_length=2,
+        in_prefill_requests=3,
+        in_decoding_requests=4,
+        avg_latency=5,
+        avg_itl=6,
+        num_swapped_requests=7,
+        finished_requests=8,
+        uptime=9,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            engine_stats_scraper=SimpleNamespace(
+                get_engine_stats=lambda: {endpoint.url: engine_stats}
+            ),
+            request_stats_monitor=SimpleNamespace(
+                get_request_stats=lambda _: {endpoint.url: request_stats}
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        log_module,
+        "get_service_discovery",
+        lambda: SimpleNamespace(get_endpoint_info=lambda: [endpoint]),
+    )
+    ticks = iter([None])
+    monkeypatch.setattr(log_module.time, "sleep", lambda _: next(ticks))
+    clear_endpoint_metrics()
+
+    with pytest.raises(StopIteration):
+        log_module.log_stats(app)
+
+    sample = next(
+        sample for metric in current_qps.collect() for sample in metric.samples
+    )
+    assert sample.value == 1
+    assert sample.labels == {
+        "workspace": "workspace",
+        "endpoint": "endpoint",
+        "server": "http://logged",
+        "replica": "inference-0",
+    }

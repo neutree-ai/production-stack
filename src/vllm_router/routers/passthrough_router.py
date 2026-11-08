@@ -108,7 +108,7 @@ async def _stream_upstream(
         headers=headers,
         params=request.query_params.multi_items(),
         data=body,
-        trace_request_ctx=trace_context(*request.state.backend_labels, backend_url),
+        trace_request_ctx=trace_context(*request.state.backend_labels),
     ) as backend_response:
         yield backend_response.headers, backend_response.status
         async for chunk in backend_response.content.iter_any():
@@ -146,7 +146,12 @@ async def route_passthrough_request(
     num_incoming_requests_total.labels(workspace=workspace, endpoint=endpoint).inc()
 
     backend = _select_backend(endpoints, (workspace, endpoint))
-    request.state.backend_labels = (backend.workspace or "", backend.endpoint or "")
+    request.state.backend_labels = (
+        backend.workspace or "",
+        backend.endpoint or "",
+        backend.url,
+        backend.pod_name or "",
+    )
     body = await request.body()
 
     logger.debug(

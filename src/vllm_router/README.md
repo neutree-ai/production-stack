@@ -66,8 +66,14 @@ backends. A cached backend may fail requests until deletion is confirmed.
 - `--engine-stats-interval`: The interval in seconds to scrape engine statistics. Default is `30`.
 - `--request-stats-window`: The sliding window seconds to compute request statistics. Default is `60`.
 
-`/metrics` also exports `router:connection_pool_waiting`, labelled by
-`workspace`, `endpoint`, and backend `server`. It counts calls waiting for an
+Backend Gauges use the labels `workspace`, `endpoint`, `server` (backend URL),
+and `replica` (inference Pod name). Static and Service-name discovery have no
+Pod identity and export an empty `replica`. The scrape target's `pod` label
+continues to identify the Router Pod. Request statistics remain indexed by URL,
+so reuse of a backend URL can briefly attribute the existing window to a new Pod.
+
+`/metrics` also exports `router:connection_pool_waiting` with these labels for
+JSON, multipart audio, and passthrough requests. It counts calls waiting for an
 aiohttp connection slot, including cleanup on connection timeout or cancellation.
 It is separate from the inference engine's scheduler queue. Each Router has its
 own pool; preserve the Router instance when diagnosing sustained waiting.

@@ -200,7 +200,7 @@ async def process_request(
             headers=headers,
             data=body,
             trace_request_ctx=trace_context(
-                *getattr(request.state, "backend_labels", ("", "")), backend_url
+                *getattr(request.state, "backend_labels", ("", "", backend_url, ""))
             ),
         ) as backend_response:
             # Yield headers and status code first.
@@ -463,7 +463,12 @@ async def route_general_request(
         f"Routing request {request_id} with session id {session_id_display} to {server_url} at {curr_time}, process time = {curr_time - in_router_time:.4f}"
     )
     selected = next(info for info in endpoints if info.url == server_url)
-    request.state.backend_labels = (selected.workspace or "", selected.endpoint or "")
+    request.state.backend_labels = (
+        selected.workspace or "",
+        selected.endpoint or "",
+        server_url,
+        selected.pod_name or "",
+    )
     stream_generator = process_request(
         request,
         request_body,
@@ -922,7 +927,10 @@ async def proxy_multipart_request(
                 data=form_data,
                 headers=headers,
                 trace_request_ctx=trace_context(
-                    selected.workspace or "", selected.endpoint or "", chosen_url
+                    selected.workspace or "",
+                    selected.endpoint or "",
+                    chosen_url,
+                    selected.pod_name or "",
                 ),
             )
             try:

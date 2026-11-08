@@ -18,8 +18,12 @@ from vllm_router.routers.routing_logic import (
     PrefixAwareRouter,
     RoundRobinRouter,
 )
+from vllm_router.services.metrics_service.forwarding import (
+    connection_pool_waiting,
+    create_trace_config,
+)
 from vllm_router.stats.request_stats import RequestStatsMonitor
-from vllm_router.utils import SingletonMeta, is_model_healthy
+from vllm_router.utils import SingletonABCMeta, SingletonMeta, is_model_healthy
 
 proxy = importlib.import_module("vllm_router.services.request_service.request")
 
@@ -27,6 +31,7 @@ proxy = importlib.import_module("vllm_router.services.request_service.request")
 @pytest.fixture
 def app(monkeypatch):
     SingletonMeta._instances.pop(RequestStatsMonitor, None)
+    SingletonABCMeta._instances.pop(RoundRobinRouter, None)
     monitor = RequestStatsMonitor(sliding_window_size=10)
     result = FastAPI()
     result.include_router(main_router)
@@ -45,6 +50,7 @@ def app(monkeypatch):
     )
     yield result
     SingletonMeta._instances.pop(RequestStatsMonitor, None)
+    SingletonABCMeta._instances.pop(RoundRobinRouter, None)
 
 
 def endpoint(url):
@@ -56,6 +62,7 @@ def endpoint(url):
         sleep=False,
         routing_logic=None,
         Id="engine",
+        pod_name="inference-0",
     )
 
 
@@ -261,6 +268,63 @@ async def test_json_input_api_preserves_payload_and_scoped_selection(app, api):
         denied = await post(app, f"/other/ep/{api}", payload=payload)
         assert denied.status_code == 404
         assert received == [payload]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["json", "multipart", "passthrough"])
+async def test_forwarding_metrics_identify_the_selected_inference_replica(
+    app, monkeypatch, protocol
+):
+    async def backend(request):
+        await request.read()
+        return web.Response(text="result")
+
+    backend_app = web.Application()
+    backend_app.router.add_post("/{path:.*}", backend)
+    async with (
+        TestServer(backend_app) as server,
+        aiohttp.ClientSession(trace_configs=[create_trace_config()]) as session,
+    ):
+        base = str(server.make_url("/")).rstrip("/")
+        app.state.endpoints = [endpoint(base)]
+        app.state.aiohttp_client_wrapper = lambda: session
+        if protocol == "passthrough":
+            passthrough = importlib.import_module(
+                "vllm_router.routers.passthrough_router"
+            )
+            app.include_router(passthrough.passthrough_router)
+            monkeypatch.setattr(
+                passthrough,
+                "_passthrough_endpoints",
+                lambda *args: app.state.endpoints,
+            )
+            response = await post(app, "/ws/ep/predict", content=b"opaque")
+        elif protocol == "multipart":
+            response = await post(
+                app,
+                "/ws/ep/v1/audio/transcriptions",
+                files=[
+                    ("file", ("clip.wav", b"RIFF", "audio/wav")),
+                    ("model", (None, "m")),
+                ],
+            )
+        else:
+            response = await post(app, "/ws/ep/pooling", payload={"model": "m"})
+
+        assert response.status_code == 200
+        assert response.text == "result"
+        assert [
+            sample.value
+            for metric in connection_pool_waiting.collect()
+            for sample in metric.samples
+            if sample.labels
+            == {
+                "workspace": "ws",
+                "endpoint": "ep",
+                "server": base,
+                "replica": "inference-0",
+            }
+        ] == [0]
 
 
 @pytest.mark.asyncio
