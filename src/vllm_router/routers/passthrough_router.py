@@ -31,7 +31,6 @@ explicitly declared routes -- including the three-segment ones such as
 ``/v1/files/{file_id}`` -- win the match.
 """
 
-import asyncio
 import uuid
 from typing import Dict, List, Tuple
 
@@ -157,7 +156,7 @@ async def route_passthrough_request(
     stream = _stream_upstream(request, backend.url, upstream_path, body)
     try:
         upstream_headers, status = await anext(stream)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return JSONResponse(
             status_code=504,
             content={"error": "Backend request timed out."},
