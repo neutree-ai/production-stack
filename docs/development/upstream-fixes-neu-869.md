@@ -1,92 +1,87 @@
 # NEU-869 Router implementation boundaries
 
 PR base: `0cb19847f0a93a9a6e3604fac28bac3b6c3e37ce` of the Neutree fork.
-Implementation started at `cd2158edbfdacb9dbae35b5ea1c7e362e282abd1`; the intervening
-base commits only update the Helm chart version.
+Only changes already merged into upstream `main` are eligible for adoption.
+Checked on 2026-11-10 against upstream main
+`405a2fa79992754d31f754c31b1eabb7183a540e`. A PR head SHA or a non-null
+GitHub `merge_commit_sha` alone is not evidence that a PR was merged.
 
-## Stage 1: selected upstream fixes
+## Confirmed upstream sources
 
-| Source | Fixed revision | Adaptation |
+| Source | Adopted revision | Mainline evidence / adaptation |
 | --- | --- | --- |
-| [#768](https://github.com/vllm-project/production-stack/pull/768) | `eb9526f20eaac96f56696174c6568afe57d08a5a` | Publish the application loop and initialize discovery fields before the watcher starts |
-| [#1040](https://github.com/vllm-project/production-stack/pull/1040) | `a4e6c0a21047de70671ece33f88753e27f79fa2d` | Cancel backend header waits on disconnect; close suspended response generators on send failure |
-| [#1168](https://github.com/vllm-project/production-stack/pull/1168) | `8edddd14b1aa0055d07d52c6591c2ff1f947ca1a` | Initialize CPU sampling and collect without blocking the request loop |
+| [#768](https://github.com/vllm-project/production-stack/pull/768) | `eb9526f20eaac96f56696174c6568afe57d08a5a` | Merged 2025-12-17; commit is an ancestor of checked main. Publish the startup loop and initialize Pod-IP watcher fields before starting the thread. |
+| [#1112](https://github.com/vllm-project/production-stack/pull/1112) | `4955696dcd4acff35b7a7ccbea183784371a0eaf` | Merged 2026-10-23; commit is an ancestor of checked main. Adapt pooling to Neutree's scoped path. |
+| [Merged audio implementation](https://github.com/vllm-project/production-stack/blob/7b1164dbe71b1f02ede85152bdfc2f383376dc2d/src/vllm_router/services/request_service/request.py) | `7b1164dbe71b1f02ede85152bdfc2f383376dc2d` | Snapshot is an ancestor of checked main (8 commits ahead, 0 behind). Adopt its shared multipart proxy, JSON/text/streaming responses and normal response cleanup. Exclude unrelated P/D/provider changes. |
 
-Retain Neutree's request-stat cleanup, tenant filtering, passthrough admission
-and per-host connection limits. Do not include #1169 header deduplication or
-`#1110` latency-window expiry. The #1040 revision includes unrelated merged
-content, so adapt the cancellation changes rather than cherry-picking it whole.
+## Withdrawn unmerged changes
 
-## Stage 2: reliability, native configuration and hooks
+All four PRs below were still open with `merged=false` and no `merged_at` on
+2026-11-10. Their implementations were removed rather than relabelled as local fixes.
 
-Adapt [#1092](https://github.com/vllm-project/production-stack/pull/1092) at
-`7adf99af02de37b3c62b32cba80db616491c2527` inside both existing Kubernetes
-discovery classes. Complete the List before dispatching existing resource
-events, preserve callbacks, and remove confirmed missing resources. Retry
-after five seconds and keep cached backends usable during failures. Pass List
-resourceVersion through to Watch without adding a version-comparison layer.
+| Source | Removed behavior |
+| --- | --- |
+| [#1040](https://github.com/vllm-project/production-stack/pull/1040) | Disconnect/header races, active upstream cancellation, `_ProxyStreamingResponse` and ASGI send-failure cleanup derived from that work. JSON/passthrough use native StreamingResponse and ordinary header waits again. |
+| [#1092](https://github.com/vllm-project/production-stack/pull/1092) | Complete relists, pagination/reconciliation, fixed five-second retries, stop events and cache-preservation changes. Discovery returns to the fork's baseline plus merged #768. |
+| [#1168](https://github.com/vllm-project/production-stack/pull/1168) | CPU priming and nonblocking samples. `/metrics` returns to the fork's `cpu_percent(interval=0.1)`. |
+| [#1156](https://github.com/vllm-project/production-stack/pull/1156) | Forwarding unknown/additional and repeated text fields when rebuilding transcription forms. Raw translation forwarding remains part of the merged audio implementation. |
 
-Configure the existing `ClientSession`/`TCPConnector` using one native
-`ClientTimeout(total=None, connect=..., sock_connect=..., sock_read=...)`.
-P/D shares that session and captures selected endpoint metadata per request.
-Discovery changes do not close an in-flight backend connection.
+## Neutree-specific features
 
-Only add `router:connection_pool_waiting`, through public native queued/start/end
-and request-exception signals. Do not add body/finally metric probes, approximate
-socket occupancy, full-body terminal counters or another HTTP wrapper. The
-configuration defaults and metric limitations are documented in the Router README.
+These are explicit product changes, not adopted upstream fixes:
 
-## Stage 3: upstream audio implementation and thin API routes
+- Native `ClientSession`/`TCPConnector` configuration with one
+  `ClientTimeout(total=None, connect=..., sock_connect=..., sock_read=...)`.
+  Per-request legacy timeouts do not override these settings.
+- `router:connection_pool_waiting`, maintained by native aiohttp queued hooks.
+  Queued-start increments; queued-end or request-exception decrements an active
+  wait once. `/metrics` exports values and prunes departed-backend series only
+  after five idle minutes with no queued calls.
+- Inference-replica labels on backend metrics, preserving the existing incoming
+  request counter dimensions and original request-stat accounting.
+- Scoped pooling, classification, transcription and translation paths.
+  Classification is a local thin route. Input-only APIs have no text prefix;
+  the local PrefixAware adapter reuses the existing low-QPS fallback.
 
-Use the audio implementation present at fixed upstream
-`b4e79de329d15ea291b46928b28517c1c919db51`, including its transcription/raw
-multipart entry points and `proxy_multipart_request` response handling.
-Streaming and non-JSON responses already exist in its PR base
-`7b1164dbe71b1f02ede85152bdfc2f383376dc2d`;
-[#1156](https://github.com/vllm-project/production-stack/pull/1156) adds the
-remaining text-field and repeated-key forwarding rules.
+The existing transcription handler is extended to expose only
+`/{workspace}/{endpoint}/v1/audio/transcriptions`. No unscoped transcription
+alias is retained. Required workspace/endpoint values come from path arguments.
 
-Adapt the complete relevant audio chain to local scope filtering, existing
-headers, native timeouts, request-stat cleanup and cancellation helpers. Close
-upload forms and backend responses on normal and interrupted paths. Retain the
-existing transcription language default; translation preserves the original
-multipart form. Do not import unrelated orchestrated P/D, provider or metric
-features from the newer upstream file.
+`route_general_transcriptions` parses and rebuilds the merged implementation's
+known transcription fields, retaining Neutree's existing `language=en` default.
+`route_multipart_request` forwards the original multipart bytes for translation
+without injecting that default. As in merged upstream, only transcription passes
+its `stream` option to the proxy; translation uses the buffered response path.
+Workspace/endpoint only filter backend candidates and select the Endpoint's routing
+policy. Multipart parsing and response handling are shared across scopes.
 
-Adapt the Pooling route from [#1112](https://github.com/vllm-project/production-stack/pull/1112)
-at `4955696dcd4acff35b7a7ccbea183784371a0eaf` to the scoped prefix. Classification
-is a local thin route. Add scoped translations and transcriptions while keeping
-the existing transcription entry. No Responses, speech, engine task schemas,
-control-plane changes or UI changes are included.
+Other retained fork/product differences from that snapshot are the existing
+`language=en` default, input validation and form cleanup, native session timeout
+settings instead of the legacy per-request 300-second deadline, queue trace labels,
+and the fork's success-aware request statistics. Transport timeouts return 504;
+connection errors return 503. These changes apply equally to every scope.
 
-## Verification scope
+The fork's existing request-stat `finally` cleanup is retained; the withdrawn
+active-disconnect and send-failure fixes are not reimplemented under another name.
+There are no new body hooks, socket occupancy approximations or full-body counters.
 
-New tests cover real normal or failure scenarios absent from the existing suite:
-startup/discovery recovery, cancellation/resource ownership, native timeout and
-configuration behavior, connection-pool waiting, and the scoped API protocols.
-Do not add migration assertions about removed private fields or tests that only
-mirror internal implementation. Local HTTP/ASGI tests do not establish real
-Kubernetes, gateway or engine compatibility.
+## Verification and compatibility boundary
 
-## Local validation
+Unit/integration tests cover the retained configuration, scoped protocols,
+normal resource cleanup, native timeout and pool-wait behavior. Tests requiring
+withdrawn fixes and duplicate parameter combinations are removed. The CLI smoke
+subprocess test is removed; startup/Watch integration belongs to deployment E2E,
+not this unit suite. No P/D adapter is included in the new multipart paths, and
+no new P/D routing bypass is retained. The new client fields
+are startup snapshots excluded from dynamic equality checks; the existing watcher
+is unchanged and does not apply those fields at runtime.
 
-Implemented on `codex/neu-869-router-stages` from the base above.
+The old unscoped transcription URL is intentionally replaced by the scoped
+Neutree path. Unknown transcription fields are not guaranteed to be forwarded.
+The former relist recovery, cache-during-outage, nonblocking CPU and active
+client-disconnect guarantees are no longer part of this change.
 
-- Full Router suite: **144 passed**, including a real CLI subprocess using the
-  Kubernetes SDK against a local API stub and real local HTTP/ASGI scenarios.
-- Baseline suite before implementation: 72 passed. Added cases cover missing
-  normal paths and production boundaries, including CLI/file hot reload,
-  discovery startup/recovery, sleep/wake, cancellation, scoped input APIs,
-  multipart fields/streaming and P/D response compatibility.
-- Executed changed production lines: **528/628 (84.1%)**, measured against the
-  base diff, including the new collector. This is changed-line coverage, not
-  whole-repository coverage or a real-cluster acceptance result.
-- All applicable pre-commit hooks and `ruff check src` passed.
-- Production Python diff: **+1131/-591, net +540**. This includes adopted upstream
-  audio code and moved event handlers; tests and documentation are separate.
-
-No image build, deployment, real Kubernetes/engine/gateway E2E, database migration
-or UI implementation was performed.
-
-The current product does not support LoRA or P/D. Their compatibility findings
-from local review remain outside this delivery by the agreed scope.
+Historical image/E2E results obtained before this revision describe the earlier
+implementation. They do not establish those withdrawn guarantees for this source.
+Native file configuration/reload, sleep/wake, LoRA and P/D remain outside product
+support. No engine task schema or new global model-routing entry is added.

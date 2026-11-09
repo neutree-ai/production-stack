@@ -34,10 +34,8 @@ def waiting(server, replica=""):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_path", ["acquired", "cancelled", "timeout"])
-@pytest.mark.parametrize("replica", ["", "inference-0"])
-async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(
-    exit_path, replica
-):
+async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(exit_path):
+    replica = "inference-0"
     # Long inference responses hold the only connection while another call queues.
     release = asyncio.Event()
     queued = asyncio.Event()
@@ -55,7 +53,7 @@ async def test_backend_pool_wait_is_balanced_and_active_series_are_preserved(
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    server = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+    server = f"http://127.0.0.1:{runner.addresses[0][1]}"
     trace = create_trace_config()
 
     async def on_queued(session, context, params):

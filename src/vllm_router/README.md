@@ -40,8 +40,8 @@ The router can be configured using command-line arguments. Below are the availab
 
 ### Backend HTTP Options
 
-These options configure the existing aiohttp client at startup. The JSON/YAML
-field names use underscores in place of the CLI hyphens.
+These options configure the existing aiohttp client at startup. Neutree supplies
+them as Router process arguments.
 
 | CLI option | Default | Meaning |
 | --- | --- | --- |
@@ -53,13 +53,9 @@ field names use underscores in place of the CLI hyphens.
 There is no total request deadline. Continuous streaming may exceed these
 durations. Timeout values accept fractional seconds from `0` to `604800`, with
 `0` disabling that timeout. Connection limits are integers from `0` to `65535`.
-Omitted or null file values use defaults; changing these four fields requires
-a restart. Other supported dynamic settings remain reloadable.
-
-Kubernetes discovery performs a complete List before restarting its Watch and
-retries failures after five seconds. Existing cached backends continue serving
-new requests during an API server outage; a successful List removes deleted
-backends. A cached backend may fail requests until deletion is confirmed.
+Omitted arguments use Router defaults; changing these four fields requires
+a process restart. Kubernetes discovery otherwise retains the fork baseline;
+no relist/reconnect or cache-during-outage fix is adopted from an unmerged PR.
 
 ### Monitoring Options
 
@@ -152,11 +148,14 @@ different endpoints for each model type.
 | `/{workspace}/{endpoint}/v1/audio/translations` | `/v1/audio/translations` | Multipart `file` and `model` |
 
 All four paths select backends within the requested workspace and endpoint.
-The existing unscoped transcription path remains available. Transcription keeps
-the existing normalized core fields and forwards additional text fields,
-including repeated keys. Translation preserves the original multipart body.
-Audio responses preserve the backend status and JSON, text or streaming content
-type. Requests use the same native HTTP configuration as other inference calls.
+The existing transcription handler now exposes only the Neutree-scoped path.
+Transcription rebuilds the known fields supported by the merged upstream audio
+implementation, retaining the existing language=en default. Forwarding arbitrary
+additional transcription fields is not included. Translation preserves the
+original multipart body, including its repeated fields. As in merged upstream,
+transcription supports streaming; translation buffers its backend response.
+Audio responses preserve the backend status and content type. Requests use the
+same native HTTP configuration as other inference calls.
 The backend engine must support the requested task; adding a Router path does
 not add an engine task or a global model-routing entry.
 

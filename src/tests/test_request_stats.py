@@ -3,7 +3,7 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI
 from starlette.requests import Request
 
 from vllm_router.services.metrics_service import (
@@ -13,10 +13,7 @@ from vllm_router.services.metrics_service import (
     num_requests_waiting,
 )
 from vllm_router.services.request_service import request as request_service
-from vllm_router.services.request_service.request import (
-    process_request,
-    route_general_request,
-)
+from vllm_router.services.request_service.request import process_request
 from vllm_router.stats.request_stats import RequestStatsMonitor, SingletonMeta
 
 
@@ -131,48 +128,6 @@ def _create_request(monitor, request_context=None):
             "app": app,
         }
     )
-
-
-def test_invalid_rewritten_json_returns_bad_request(monkeypatch):
-    app = FastAPI()
-    app.state.router = None
-    app.state.semantic_cache_available = False
-    request_body = b'{"model": "model"}'
-
-    async def receive():
-        return {"type": "http.request", "body": request_body, "more_body": False}
-
-    request = Request(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/chat/completions",
-            "raw_path": b"/v1/chat/completions",
-            "query_string": b"",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "server": ("testserver", 80),
-            "app": app,
-        },
-        receive=receive,
-    )
-    rewriter = SimpleNamespace(rewrite_request=lambda *args: b"not-json")
-    monkeypatch.setattr(
-        request_service, "is_request_rewriter_initialized", lambda: True
-    )
-    monkeypatch.setattr(request_service, "get_request_rewriter", lambda: rewriter)
-
-    async def route_request():
-        with pytest.raises(HTTPException) as exc_info:
-            await route_general_request(
-                request, "/v1/chat/completions", BackgroundTasks()
-            )
-        assert exc_info.value.status_code == 400
-
-    asyncio.run(route_request())
 
 
 def test_closing_stream_before_first_token_releases_request_stats(monitor):
@@ -385,7 +340,7 @@ def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch, pod_na
     ) in current_qps._metrics
 
 
-def test_log_stats_exports_inference_replica_labels(monkeypatch):
+def test_log_stats_exports_inference_replica_labels(monitor, monkeypatch):
     log_module = importlib.import_module("vllm_router.stats.log_stats")
     endpoint = SimpleNamespace(
         url="http://logged",
@@ -394,32 +349,12 @@ def test_log_stats_exports_inference_replica_labels(monkeypatch):
         pod_name="inference-0",
         model_info={},
     )
-    engine_stats = SimpleNamespace(
-        num_running_requests=1,
-        num_queuing_requests=0,
-        gpu_prefix_cache_hit_rate=0.5,
-        gpu_prefix_cache_hits_total=10,
-        gpu_prefix_cache_queries_total=20,
-    )
-    request_stats = SimpleNamespace(
-        qps=1,
-        avg_decoding_length=2,
-        in_prefill_requests=3,
-        in_decoding_requests=4,
-        avg_latency=5,
-        avg_itl=6,
-        num_swapped_requests=7,
-        finished_requests=8,
-        uptime=9,
-    )
+    monitor.on_new_request(endpoint.url, "completed", timestamp=100)
+    monitor.on_request_complete(endpoint.url, "completed", timestamp=102)
     app = SimpleNamespace(
         state=SimpleNamespace(
-            engine_stats_scraper=SimpleNamespace(
-                get_engine_stats=lambda: {endpoint.url: engine_stats}
-            ),
-            request_stats_monitor=SimpleNamespace(
-                get_request_stats=lambda _: {endpoint.url: request_stats}
-            ),
+            engine_stats_scraper=SimpleNamespace(get_engine_stats=lambda: {}),
+            request_stats_monitor=monitor,
         )
     )
     monkeypatch.setattr(
@@ -429,6 +364,7 @@ def test_log_stats_exports_inference_replica_labels(monkeypatch):
     )
     ticks = iter([None])
     monkeypatch.setattr(log_module.time, "sleep", lambda _: next(ticks))
+    monkeypatch.setattr(log_module.time, "time", lambda: 103)
     clear_endpoint_metrics()
 
     with pytest.raises(StopIteration):
@@ -437,7 +373,7 @@ def test_log_stats_exports_inference_replica_labels(monkeypatch):
     sample = next(
         sample for metric in current_qps.collect() for sample in metric.samples
     )
-    assert sample.value == 1
+    assert sample.value == 0.1
     assert sample.labels == {
         "workspace": "workspace",
         "endpoint": "endpoint",

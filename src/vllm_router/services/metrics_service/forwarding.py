@@ -30,6 +30,7 @@ async def _request_started(session, context, params):
         return
     try:
         data = context.trace_request_ctx
+        # Keep the request's selected identity across later discovery updates.
         context.queue_key = (
             data["workspace"],
             data["endpoint"],
@@ -58,6 +59,7 @@ async def _queue_started(session, context, params):
 
 
 async def _queue_finished(session, context, params):
+    # A request error after acquisition must not decrement the same wait twice.
     if not getattr(context, "queued", False):
         return
     try:
@@ -80,6 +82,7 @@ def create_trace_config():
 
 
 def prune_forwarding_metrics(endpoints, *, now=None):
+    """Drop departed-backend queue labels after five idle minutes; keep active waits."""
     current = {
         (ep.workspace or "", ep.endpoint or "", ep.url, ep.pod_name or "")
         for ep in endpoints

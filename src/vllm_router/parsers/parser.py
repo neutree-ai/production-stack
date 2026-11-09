@@ -81,7 +81,6 @@ def load_initial_config_from_config_file_if_required(
             f"Initial loading of dynamic YAML config file at {dynamic_config_yaml}"
         )
         yaml_config = read_and_process_yaml_config_file(dynamic_config_yaml)
-        yaml_config = {**yaml_config, **normalize_client_config(yaml_config)}
         parser.set_defaults(**yaml_config)
         args = parser.parse_args()
     elif dynamic_config_json:
@@ -89,8 +88,7 @@ def load_initial_config_from_config_file_if_required(
             f"Initial loading of dynamic JSON config file at {dynamic_config_json}"
         )
         with open(dynamic_config_json, encoding="utf-8") as f:
-            config = json.load(f)
-            parser.set_defaults(**{**config, **normalize_client_config(config)})
+            parser.set_defaults(**json.load(f))
             args = parser.parse_args()
 
     return args

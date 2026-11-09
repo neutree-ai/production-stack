@@ -36,18 +36,13 @@ import uuid
 from typing import Dict, List, Tuple
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
-from starlette.requests import ClientDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm_router.log import init_logger
 from vllm_router.service_discovery import EndpointInfo, get_service_discovery
 from vllm_router.services.metrics_service import num_incoming_requests_total
 from vllm_router.services.metrics_service.forwarding import trace_context
-from vllm_router.services.request_service.request import (
-    _HOP_BY_HOP_HEADERS,
-    _anext_or_disconnect,
-    _ProxyStreamingResponse,
-)
+from vllm_router.services.request_service.request import _HOP_BY_HOP_HEADERS
 
 passthrough_router = APIRouter()
 
@@ -161,9 +156,7 @@ async def route_passthrough_request(
 
     stream = _stream_upstream(request, backend.url, upstream_path, body)
     try:
-        upstream_headers, status = await _anext_or_disconnect(stream, request)
-    except ClientDisconnect:
-        return Response(status_code=499)
+        upstream_headers, status = await anext(stream)
     except asyncio.TimeoutError:
         return JSONResponse(
             status_code=504,
@@ -183,7 +176,7 @@ async def route_passthrough_request(
 
     # No media_type=: Content-Type is already in response_headers, and
     # Response.init_headers only fills one in when the headers dict lacks it.
-    return _ProxyStreamingResponse(
+    return StreamingResponse(
         stream,
         status_code=status,
         headers=response_headers,
