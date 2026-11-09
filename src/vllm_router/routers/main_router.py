@@ -97,7 +97,7 @@ async def route_embeddings(
     )
 
 
-# Adapted from upstream #1112 with Neutree's scoped route prefix.
+# Upstream vllm-project/production-stack#1112 (4955696), with Neutree's scope.
 @main_router.post("/{workspace}/{endpoint}/pooling")
 async def route_pooling(
     workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
@@ -122,15 +122,6 @@ async def route_audio_translations(
 ):
     return await route_multipart_request(
         request, "/v1/audio/translations", background_tasks, workspace, endpoint
-    )
-
-
-@main_router.post("/{workspace}/{endpoint}/v1/audio/transcriptions")
-async def route_scoped_audio_transcriptions(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
-):
-    return await route_general_transcriptions(
-        request, "/v1/audio/transcriptions", background_tasks, workspace, endpoint
     )
 
 
@@ -348,11 +339,16 @@ async def health() -> Response:
         return JSONResponse(content={"status": "healthy"}, status_code=200)
 
 
-@main_router.post("/v1/audio/transcriptions")
+# Extend the existing transcription endpoint with Neutree's required scope.
+@main_router.post("/{workspace}/{endpoint}/v1/audio/transcriptions")
 async def route_v1_audio_transcriptions(
-    request: Request, background_tasks: BackgroundTasks
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
 ):
     """Handles audio transcription requests."""
     return await route_general_transcriptions(
-        request, "/v1/audio/transcriptions", background_tasks
+        request,
+        "/v1/audio/transcriptions",
+        background_tasks,
+        workspace,
+        endpoint,
     )

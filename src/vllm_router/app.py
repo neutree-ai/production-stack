@@ -32,7 +32,7 @@ from vllm_router.parsers.parser import parse_args
 from vllm_router.routers.batches_router import batches_router
 from vllm_router.routers.files_router import files_router
 from vllm_router.routers.main_router import main_router
-from vllm_router.routers.metrics_router import initialize_cpu_sampling, metrics_router
+from vllm_router.routers.metrics_router import metrics_router
 from vllm_router.routers.passthrough_router import passthrough_router
 from vllm_router.routers.routing_logic import (
     AllInitRoutingLogics,
@@ -89,7 +89,9 @@ logger = logging.getLogger("uvicorn")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Upstream vllm-project/production-stack#768 (eb9526f): publish the loop early.
     app.state.event_loop = asyncio.get_running_loop()
+    # Keep one client across discovery refreshes so in-flight calls keep their sockets.
     app.state.aiohttp_client_wrapper.start(
         timeout=app.state.aiohttp_timeout,
         max_connections_per_backend=app.state.max_connections_per_backend,
@@ -97,8 +99,8 @@ async def lifespan(app: FastAPI):
     )
     try:
         service_discovery = get_service_discovery()
-        service_discovery.set_event_loop(app.state.event_loop)
-        initialize_cpu_sampling()
+        if hasattr(service_discovery, "set_event_loop"):
+            service_discovery.set_event_loop(app.state.event_loop)
         if hasattr(app.state, "batch_processor"):
             await app.state.batch_processor.initialize()
 

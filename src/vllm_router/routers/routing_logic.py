@@ -468,6 +468,7 @@ class PrefixAwareRouter(RoutingInterface):
             longest prefix match)
         """
 
+        # Local: input-only APIs have no text prefix; reuse the existing QPS fallback.
         if "messages" not in request_json and "prompt" not in request_json:
             return self._qps_routing(endpoints, request_stats)
 

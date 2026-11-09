@@ -22,12 +22,9 @@ import uuid
 from typing import Optional
 
 import aiohttp
-import anyio
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile
-from starlette.requests import ClientDisconnect
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
@@ -73,71 +70,6 @@ _HOP_BY_HOP_HEADERS = {
     "te",  # codespell:ignore
     "trailer",
 }
-
-
-# Adapted from production-stack #1040; preserve independent caller cancellation.
-async def _cancel_and_wait(task):
-    current = asyncio.current_task()
-    pending_before = current.cancelling() if current else 0
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        if current is not None and current.cancelling() > pending_before:
-            raise
-    except Exception:
-        # A backend error racing the disconnect cannot be delivered to this client.
-        pass
-
-
-async def _listen_for_disconnect(request):
-    while True:
-        if (await request.receive())["type"] == "http.disconnect":
-            return
-
-
-async def _anext_or_disconnect(stream, request):
-    headers_task = asyncio.ensure_future(anext(stream))
-    disconnect_task = asyncio.create_task(_listen_for_disconnect(request))
-    received_headers = False
-    try:
-        await asyncio.wait(
-            (headers_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
-        )
-        if headers_task.done():
-            result = headers_task.result()
-            received_headers = True
-            return result
-        raise ClientDisconnect()
-    finally:
-        try:
-            with anyio.CancelScope(shield=True):
-                try:
-                    await _cancel_and_wait(disconnect_task)
-                finally:
-                    if not headers_task.done():
-                        await _cancel_and_wait(headers_task)
-        except BaseException:
-            with anyio.CancelScope(shield=True):
-                await stream.aclose()
-            raise
-        if not received_headers:
-            with anyio.CancelScope(shield=True):
-                await stream.aclose()
-
-
-class _ProxyStreamingResponse(StreamingResponse):
-    async def __call__(self, scope, receive, send):
-        background, self.background = self.background, None
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            with anyio.CancelScope(shield=True):
-                try:
-                    await self.body_iterator.aclose()
-                finally:
-                    if background is not None:
-                        await background()
 
 
 # TODO: (Brian) check if request is json beforehand
@@ -231,6 +163,7 @@ async def process_request(
         exception_type = type(exc).__name__
         raise
     finally:
+        # Every exit releases active state; only a fully read response is completed.
         stage, active_after = request_stats_monitor.on_request_complete(
             backend_url, request_id, time.time(), success=success
         )
@@ -283,9 +216,7 @@ async def route_general_request(
     Returns:
         StreamingResponse: A response object that streams data from the backend server to the client.
     """
-    if isinstance(
-        request.app.state.router, DisaggregatedPrefillRouter
-    ) and endpoint not in {"/pooling", "/classify"}:
+    if isinstance(request.app.state.router, DisaggregatedPrefillRouter):
         response = await route_disaggregated_prefill_request(
             request, endpoint, background_tasks
         )
@@ -463,6 +394,7 @@ async def route_general_request(
         f"Routing request {request_id} with session id {session_id_display} to {server_url} at {curr_time}, process time = {curr_time - in_router_time:.4f}"
     )
     selected = next(info for info in endpoints if info.url == server_url)
+    # Discovery may replace this backend before the request's queue hooks run.
     request.state.backend_labels = (
         selected.workspace or "",
         selected.endpoint or "",
@@ -478,10 +410,9 @@ async def route_general_request(
         background_tasks,
     )
     try:
-        headers, status = await _anext_or_disconnect(stream_generator, request)
-    except ClientDisconnect:
-        return Response(status_code=499)
+        headers, status = await anext(stream_generator)
     except asyncio.TimeoutError:
+        # Downstream headers have not been sent, so an early timeout can be a 504.
         return JSONResponse(
             status_code=504,
             content={"error": "Backend request timed out."},
@@ -489,7 +420,7 @@ async def route_general_request(
         )
     headers_dict = {key: value for key, value in headers.items()}
     headers_dict["X-Request-Id"] = request_id
-    return _ProxyStreamingResponse(
+    return StreamingResponse(
         stream_generator,
         status_code=status,
         headers=headers_dict,
@@ -498,50 +429,35 @@ async def route_general_request(
 
 
 async def send_request_to_prefiller(
-    client: aiohttp.ClientSession,
-    endpoint: str,
-    req_data: dict,
-    request_id: str,
-    *,
-    trace_request_ctx=None,
+    client: aiohttp.ClientSession, endpoint: str, req_data: dict, request_id: str
 ):
     """Send a request to a prefiller service."""
     req_data = req_data.copy()
     req_data["max_tokens"] = 1
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
-    # Prefill consumes one JSON result before decode; a client SSE request must not propagate here.
-    req_data["stream"] = False
-    req_data.pop("stream_options", None)
+
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
-    async with client.post(
-        endpoint, json=req_data, headers=headers, trace_request_ctx=trace_request_ctx
-    ) as response:
+
+    async with client.post(endpoint, json=req_data, headers=headers) as response:
         response.raise_for_status()
         return await response.json()
 
 
 async def send_request_to_decode(
-    client: aiohttp.ClientSession,
-    endpoint: str,
-    req_data: dict,
-    request_id: str,
-    *,
-    trace_request_ctx=None,
+    client: aiohttp.ClientSession, endpoint: str, req_data: dict, request_id: str
 ):
-    """Stream decode headers and content using the shared client."""
+    """Asynchronously stream the response from a service using a persistent client."""
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
-    async with client.post(
-        endpoint, json=req_data, headers=headers, trace_request_ctx=trace_request_ctx
-    ) as response:
+
+    async with client.post(endpoint, json=req_data, headers=headers) as response:
         response.raise_for_status()
-        yield response.headers, response.status
         async for chunk in response.content.iter_any():
             yield chunk
 
@@ -551,75 +467,94 @@ async def route_disaggregated_prefill_request(
     endpoint: str,
     background_tasks: BackgroundTasks,
 ):
+    in_router_time = time.time()
+    # Same as vllm, Get request_id from X-Request-Id header if available
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request_json = await request.json()
-    prefiller = getattr(request.app.state, "prefill_endpoint", None)
-    decoder = getattr(request.app.state, "decode_endpoint", None)
-    if prefiller is None or decoder is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "P/D backend unavailable."},
-            headers={"X-Request-Id": request_id},
-        )
-    client = request.app.state.aiohttp_client_wrapper()
 
-    async def prefill():
-        yield await send_request_to_prefiller(
-            client,
-            prefiller.url + endpoint,
-            request_json,
-            request_id,
-            trace_request_ctx=trace_context(
-                prefiller.workspace or "", prefiller.endpoint or "", prefiller.url
-            ),
-        )
-
-    prefill_stream = prefill()
+    orig_max_tokens = request_json.get("max_tokens", 0)
+    request_json["max_tokens"] = 1
+    st = time.time()
     try:
+        await send_request_to_prefiller(
+            request.app.state.prefill_client, endpoint, request_json, request_id
+        )
+        et = time.time()
+        logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
+        logger.info(
+            f"Routing request {request_id} with session id None to {request.app.state.prefill_client._base_url} at {et}, process time = {et - in_router_time:.4f}"
+        )
+        request_json["max_tokens"] = orig_max_tokens
+    except aiohttp.ClientResponseError as e:
+        logger.error(f"HTTP error in prefiller: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=e.status,
+            content={
+                "error": {
+                    "message": f"Prefiller error: {e.message}",
+                    "type": "prefiller_error",
+                    "code": e.status,
+                }
+            },
+            headers={"X-Request-Id": request_id},
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in prefiller: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": f"Prefiller error: {str(e)}",
+                    "type": "prefiller_error",
+                    "code": 500,
+                }
+            },
+            headers={"X-Request-Id": request_id},
+        )
+
+    async def generate_stream():
         try:
-            await _anext_or_disconnect(prefill_stream, request)
-        finally:
-            with anyio.CancelScope(shield=True):
-                await prefill_stream.aclose()
-        stream = send_request_to_decode(
-            client,
-            decoder.url + endpoint,
-            request_json,
-            request_id,
-            trace_request_ctx=trace_context(
-                decoder.workspace or "", decoder.endpoint or "", decoder.url
-            ),
-        )
-        headers, status = await _anext_or_disconnect(stream, request)
-    except ClientDisconnect:
-        return Response(status_code=499)
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            status_code=504,
-            content={"error": "Backend request timed out."},
-            headers={"X-Request-Id": request_id},
-        )
-    except aiohttp.ClientResponseError as exc:
-        return JSONResponse(
-            status_code=exc.status,
-            content={"error": {"message": exc.message, "code": exc.status}},
-            headers={"X-Request-Id": request_id},
-        )
-    except aiohttp.ClientError:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "Failed to connect to P/D backend."},
-            headers={"X-Request-Id": request_id},
-        )
-    # aiohttp decompresses the body; the outgoing stream receives fresh framing.
-    response_headers = {
-        key: value
-        for key, value in headers.items()
-        if key.lower()
-        not in {"content-length", "content-encoding", "transfer-encoding", "connection"}
-    }
-    response_headers["X-Request-Id"] = request_id
-    return _ProxyStreamingResponse(stream, status_code=status, headers=response_headers)
+            async for chunk in send_request_to_decode(
+                request.app.state.decode_client, endpoint, request_json, request_id
+            ):
+                yield chunk
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"HTTP error in decoder: {e}", exc_info=True)
+            try:
+                error_text = e.message
+            except Exception:
+                error_text = f"HTTP {e.status}"
+            # Yield error as JSON response
+            error_response = {
+                "error": {
+                    "message": f"Decoder error: {error_text}",
+                    "type": "decoder_error",
+                    "code": e.status,
+                }
+            }
+            yield json.dumps(error_response).encode("utf-8")
+        except Exception as e:
+            logger.error(f"Unexpected error in decoder: {e}", exc_info=True)
+            # Yield error as JSON response
+            error_response = {
+                "error": {
+                    "message": f"Decoder error: {str(e)}",
+                    "type": "decoder_error",
+                    "code": 500,
+                }
+            }
+            yield json.dumps(error_response).encode("utf-8")
+
+    curr_time = time.time()
+    logger.info(
+        f"Routing request {request_id} with session id None to {request.app.state.decode_client._base_url} at {curr_time}, process time = {curr_time - et:.4f}"
+    )
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="application/json",
+        headers={"X-Request-Id": request_id},
+    )
 
 
 async def route_sleep_wakeup_request(
@@ -701,7 +636,7 @@ async def route_sleep_wakeup_request(
             )
 
 
-# Adapted from upstream #1156 (b4e79de): keep its shared multipart proxy.
+# Merged upstream 7b1164d: shared audio forwarding; scope only changes selection.
 async def route_general_transcriptions(
     request: Request,
     endpoint: str,
@@ -711,7 +646,6 @@ async def route_general_transcriptions(
 ):
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     form = await request.form()
-    transferred = False
     try:
         file = form.get("file")
         model = form.get("model")
@@ -725,6 +659,7 @@ async def route_general_transcriptions(
             temperature = float(form["temperature"]) if "temperature" in form else None
             if temperature is not None and not math.isfinite(temperature):
                 raise ValueError()
+            # Retain the fork's default; merged upstream defaults to no language.
             language = form.get("language", "en")
             stream = str(form.get("stream", "false")).lower() == "true"
             if not isinstance(language, str):
@@ -743,7 +678,10 @@ async def route_general_transcriptions(
             filename=file.filename,
             content_type=file.content_type,
         )
-        data = {"model": model, "language": language}
+        data = {"model": model}
+        language = language.strip()
+        if language and language.lower() not in ("none", "null", "undefined"):
+            data["language"] = language
         for key in ("prompt", "response_format"):
             value = form.get(key, "json" if key == "response_format" else None)
             if value:
@@ -758,19 +696,6 @@ async def route_general_transcriptions(
             data["stream"] = "true"
         for key, value in data.items():
             form_data.add_field(key, value)
-        rebuilt = (
-            "file",
-            "model",
-            "language",
-            "prompt",
-            "response_format",
-            "temperature",
-            "stream",
-        )
-        for key, value in form.multi_items():
-            if key not in rebuilt and isinstance(value, str):
-                form_data.add_field(key, value)
-        transferred = True
         return await proxy_multipart_request(
             form_data,
             model,
@@ -779,12 +704,9 @@ async def route_general_transcriptions(
             stream=stream,
             workspace=workspace,
             endpoint_name=endpoint_name,
-            source_form=form,
         )
     finally:
-        if not transferred:
-            with anyio.CancelScope(shield=True):
-                await form.close()
+        await form.close()
 
 
 async def route_multipart_request(
@@ -794,9 +716,9 @@ async def route_multipart_request(
     workspace: Optional[str] = None,
     endpoint_name: Optional[str] = None,
 ):
+    # Raw translation keeps the original multipart bytes and its boundary.
     body = await request.body()
     form = await request.form()
-    transferred = False
     try:
         model = form.get("model")
         if (
@@ -808,25 +730,20 @@ async def route_multipart_request(
                 status_code=400,
                 content={"error": "A file and non-empty model are required."},
             )
-        transferred = True
         return await proxy_multipart_request(
             body,
             model,
             endpoint,
             request,
-            stream=str(form.get("stream", "false")).lower() == "true",
             workspace=workspace,
             endpoint_name=endpoint_name,
-            source_form=form,
         )
     finally:
-        if not transferred:
-            with anyio.CancelScope(shield=True):
-                await form.close()
+        await form.close()
 
 
 async def proxy_multipart_request(
-    form_data,
+    form_data: bytes | aiohttp.FormData,
     model: str,
     endpoint: str,
     request: Request,
@@ -834,82 +751,51 @@ async def proxy_multipart_request(
     stream: bool = False,
     workspace: Optional[str] = None,
     endpoint_name: Optional[str] = None,
-    source_form=None,
 ):
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     monitor = request.app.state.request_stats_monitor
-    stats_id = str(uuid.uuid4())
-    started = False
-    transferred = False
-    success = False
-    backend_stream = None
-    chosen_url = None
-    closed = False
-
-    async def close_resources():
-        nonlocal closed
-        if closed:
-            return
-        closed = True
-        try:
-            if backend_stream is not None:
-                await backend_stream.aclose()
-        finally:
-            try:
-                if started:
-                    monitor.on_request_complete(
-                        chosen_url, stats_id, time.time(), success=success
-                    )
-            finally:
-                if source_form is not None:
-                    with anyio.CancelScope(shield=True):
-                        await source_form.close()
-
-    try:
-        endpoints = [
-            info
-            for info in get_service_discovery().get_endpoint_info()
-            if model in info.model_names
-            and not info.sleep
-            and (workspace is None or info.workspace == workspace)
-            and (endpoint_name is None or info.endpoint == endpoint_name)
-        ]
-        if not endpoints:
-            return JSONResponse(
-                status_code=404,
-                content={"error": f"No backend for model {model}"},
-                headers={"X-Request-Id": request_id},
-            )
-        router = (
-            get_routing_logic_by_type(
-                endpoints[0].routing_logic or RoutingLogic.ROUND_ROBIN
-            )
-            if workspace is not None
-            else request.app.state.router
+    endpoints = [
+        info
+        for info in get_service_discovery().get_endpoint_info()
+        if model in info.model_names
+        and not info.sleep
+        and (workspace is None or info.workspace == workspace)
+        and (endpoint_name is None or info.endpoint == endpoint_name)
+    ]
+    if not endpoints:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No backend for model {model}"},
+            headers={"X-Request-Id": request_id},
         )
-        scraper = request.app.state.engine_stats_scraper
-        engine_stats = scraper.engine_stats if scraper is not None else {}
-        stats = monitor.get_request_stats(time.time())
-        if isinstance(
-            router,
-            (
-                KvawareRouter,
-                PrefixAwareRouter,
-                SessionRouter,
-                ConsistentHashRouter,
-                StaticHashRouter,
-            ),
-        ):
-            chosen_url = await router.route_request(
-                endpoints, engine_stats, stats, request, {}
-            )
-        elif isinstance(router, DisaggregatedPrefillRouter):
-            chosen_url = router.route_request(
-                endpoints, engine_stats, stats, request, {}
-            )
-        else:
-            chosen_url = router.route_request(endpoints, engine_stats, stats, request)
-        selected = next(info for info in endpoints if info.url == chosen_url)
+    router = (
+        get_routing_logic_by_type(
+            endpoints[0].routing_logic or RoutingLogic.ROUND_ROBIN
+        )
+        if workspace is not None
+        else request.app.state.router
+    )
+    scraper = request.app.state.engine_stats_scraper
+    engine_stats = scraper.engine_stats if scraper is not None else {}
+    stats = monitor.get_request_stats(time.time())
+    if isinstance(
+        router,
+        (
+            KvawareRouter,
+            PrefixAwareRouter,
+            SessionRouter,
+            ConsistentHashRouter,
+            StaticHashRouter,
+        ),
+    ):
+        chosen_url = await router.route_request(
+            endpoints, engine_stats, stats, request, {}
+        )
+    else:
+        chosen_url = router.route_request(endpoints, engine_stats, stats, request)
+    selected = next(info for info in endpoints if info.url == chosen_url)
+    try:
+        # Rebuilt forms need aiohttp's new boundary; raw multipart keeps its header.
         headers = {
             key: value
             for key, value in request.headers.items()
@@ -918,11 +804,10 @@ async def proxy_multipart_request(
             and (isinstance(form_data, bytes) or key.lower() != "content-type")
         }
         headers["X-Request-Id"] = request_id
+        stats_id = str(uuid.uuid4())
         monitor.on_new_request(chosen_url, stats_id, time.time())
-        started = True
-
-        async def open_response():
-            response = await request.app.state.aiohttp_client_wrapper().post(
+        try:
+            backend_response = await request.app.state.aiohttp_client_wrapper().post(
                 f"{chosen_url}{endpoint}",
                 data=form_data,
                 headers=headers,
@@ -933,13 +818,11 @@ async def proxy_multipart_request(
                     selected.pod_name or "",
                 ),
             )
-            try:
-                yield response
-            finally:
-                response.close()
-
-        backend_stream = open_response()
-        backend_response = await _anext_or_disconnect(backend_stream, request)
+        except Exception:
+            monitor.on_request_complete(
+                chosen_url, stats_id, time.time(), success=False
+            )
+            raise
         resp_headers = {
             key: value
             for key, value in backend_response.headers.items()
@@ -956,8 +839,8 @@ async def proxy_multipart_request(
         if stream:
 
             async def traced_stream():
-                nonlocal success
                 first_token = False
+                success = False
                 try:
                     async for chunk in backend_response.content.iter_any():
                         if not first_token:
@@ -969,52 +852,56 @@ async def proxy_multipart_request(
                             yield chunk
                     success = True
                 finally:
-                    with anyio.CancelScope(shield=True):
-                        await close_resources()
+                    backend_response.close()
+                    monitor.on_request_complete(
+                        chosen_url, stats_id, time.time(), success=success
+                    )
 
-            transferred = True
-            return _ProxyStreamingResponse(
+            return StreamingResponse(
                 traced_stream(),
                 status_code=backend_response.status,
                 headers=resp_headers,
                 media_type=backend_response.headers.get(
                     "content-type", "text/event-stream"
                 ),
-                background=BackgroundTask(close_resources),
             )
-        monitor.on_request_response(chosen_url, stats_id, time.time())
-        media_type = (
-            backend_response.headers.get("content-type", "")
-            .partition(";")[0]
-            .strip()
-            .lower()
-        )
-        is_json = media_type == "application/json" or media_type.endswith("+json")
-
-        async def read_body():
-            yield await (
+        success = False
+        try:
+            monitor.on_request_response(chosen_url, stats_id, time.time())
+            media_type = (
+                backend_response.headers.get("content-type", "")
+                .partition(";")[0]
+                .strip()
+                .lower()
+            )
+            is_json = media_type == "application/json" or media_type.endswith("+json")
+            content = await (
                 backend_response.json() if is_json else backend_response.read()
             )
-
-        body_stream = read_body()
-        try:
-            content = await _anext_or_disconnect(body_stream, request)
-        except (aiohttp.ContentTypeError, json.JSONDecodeError):
+            success = True
+            response_type = JSONResponse if is_json else Response
+            return response_type(
+                content=content,
+                status_code=backend_response.status,
+                headers=resp_headers,
+            )
+        except (aiohttp.ContentTypeError, json.JSONDecodeError) as parse_error:
+            try:
+                text_content = await backend_response.text()
+            except aiohttp.ClientError:
+                text_content = str(parse_error)
             return JSONResponse(
                 status_code=502,
-                content={"error": "Backend returned invalid JSON."},
-                headers={"X-Request-Id": request_id},
+                content={
+                    "error": f"Backend returned non-JSON response: {text_content}"
+                },
+                headers=resp_headers,
             )
         finally:
-            with anyio.CancelScope(shield=True):
-                await body_stream.aclose()
-        success = True
-        response_type = JSONResponse if is_json else Response
-        return response_type(
-            content=content, status_code=backend_response.status, headers=resp_headers
-        )
-    except ClientDisconnect:
-        return Response(status_code=499)
+            backend_response.close()
+            monitor.on_request_complete(
+                chosen_url, stats_id, time.time(), success=success
+            )
     except asyncio.TimeoutError:
         return JSONResponse(
             status_code=504,
@@ -1027,7 +914,6 @@ async def proxy_multipart_request(
             content={"error": "Failed to connect to backend."},
             headers={"X-Request-Id": request_id},
         )
-    finally:
-        if not transferred:
-            with anyio.CancelScope(shield=True):
-                await close_resources()
+    except Exception as exc:
+        logger.error(exc)
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
