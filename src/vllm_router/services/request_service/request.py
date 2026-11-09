@@ -411,7 +411,7 @@ async def route_general_request(
     )
     try:
         headers, status = await anext(stream_generator)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Downstream headers have not been sent, so an early timeout can be a 504.
         return JSONResponse(
             status_code=504,
@@ -641,8 +641,8 @@ async def route_general_transcriptions(
     request: Request,
     endpoint: str,
     background_tasks: BackgroundTasks,
-    workspace: Optional[str] = None,
-    endpoint_name: Optional[str] = None,
+    workspace: str | None = None,
+    endpoint_name: str | None = None,
 ):
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     form = await request.form()
@@ -663,7 +663,7 @@ async def route_general_transcriptions(
             language = form.get("language", "en")
             stream = str(form.get("stream", "false")).lower() == "true"
             if not isinstance(language, str):
-                raise ValueError()
+                raise TypeError()
         except (TypeError, ValueError):
             return JSONResponse(
                 status_code=400,
@@ -713,8 +713,8 @@ async def route_multipart_request(
     request: Request,
     endpoint: str,
     background_tasks: BackgroundTasks,
-    workspace: Optional[str] = None,
-    endpoint_name: Optional[str] = None,
+    workspace: str | None = None,
+    endpoint_name: str | None = None,
 ):
     # Raw translation keeps the original multipart bytes and its boundary.
     body = await request.body()
@@ -749,8 +749,8 @@ async def proxy_multipart_request(
     request: Request,
     *,
     stream: bool = False,
-    workspace: Optional[str] = None,
-    endpoint_name: Optional[str] = None,
+    workspace: str | None = None,
+    endpoint_name: str | None = None,
 ):
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     monitor = request.app.state.request_stats_monitor
@@ -902,7 +902,7 @@ async def proxy_multipart_request(
             monitor.on_request_complete(
                 chosen_url, stats_id, time.time(), success=success
             )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return JSONResponse(
             status_code=504,
             content={"error": "Backend request timed out."},

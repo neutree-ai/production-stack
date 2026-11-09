@@ -353,7 +353,7 @@ def test_log_stats_exports_inference_replica_labels(monitor, monkeypatch):
     monitor.on_request_complete(endpoint.url, "completed", timestamp=102)
     app = SimpleNamespace(
         state=SimpleNamespace(
-            engine_stats_scraper=SimpleNamespace(get_engine_stats=lambda: {}),
+            engine_stats_scraper=SimpleNamespace(get_engine_stats=dict),
             request_stats_monitor=monitor,
         )
     )

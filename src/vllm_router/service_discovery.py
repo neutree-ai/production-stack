@@ -479,7 +479,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 self.initialize_client_sessions(), self.event_loop
             )
         except Exception as e:
-            logger.warning(f"Deferred client session init failed: {e}")
+            logger.warning(f"Deferred client session init failed: {e}", exc_info=True)
 
     def _trigger_callbacks(
         self,
