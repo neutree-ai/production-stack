@@ -38,6 +38,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          provenance: false
           file: docker/Dockerfile.neutree
           push: true
           build-args: |
@@ -71,6 +72,7 @@ jobs:
           context: .
           file: docker/Dockerfile.neutree
           platforms: linux/arm64
+          provenance: false
           push: true
           build-args: |
             CLUSTER_VERSION=${{ github.event.inputs.image_tag }}
