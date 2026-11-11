@@ -69,6 +69,18 @@ def test_unsuccessful_completion_does_not_increment_finished_requests(monitor):
     assert stats.active_requests == 0
 
 
+def test_average_latency_expires_without_new_requests(monitor):
+    engine_url = "http://engine"
+    monitor.on_new_request(engine_url, "slow", timestamp=100)
+    monitor.on_request_complete(engine_url, "slow", timestamp=106)
+    monitor.on_new_request(engine_url, "fast", timestamp=110)
+    monitor.on_request_complete(engine_url, "fast", timestamp=111)
+
+    assert monitor.get_request_stats(current_time=111)[engine_url].avg_latency == 3.5
+    assert monitor.get_request_stats(current_time=117)[engine_url].avg_latency == 1
+    assert monitor.get_request_stats(current_time=122)[engine_url].avg_latency == -1
+
+
 class _HangingContent:
     async def iter_any(self):
         yield b"first-token"

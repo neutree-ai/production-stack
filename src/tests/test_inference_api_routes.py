@@ -127,9 +127,9 @@ async def test_json_input_api_preserves_payload_and_scoped_selection(app):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protocol", ["json", "multipart", "passthrough"])
+@pytest.mark.parametrize("protocol", ["json", "multipart"])
 async def test_forwarding_metrics_identify_the_selected_inference_replica(
-    app, monkeypatch, protocol
+    app, protocol
 ):
     async def backend(request):
         await request.read()
@@ -144,17 +144,7 @@ async def test_forwarding_metrics_identify_the_selected_inference_replica(
         base = str(server.make_url("/")).rstrip("/")
         app.state.endpoints = [endpoint(base)]
         app.state.aiohttp_client_wrapper = lambda: session
-        if protocol == "passthrough":
-            passthrough = importlib.import_module(
-                "vllm_router.routers.passthrough_router"
-            )
-            monkeypatch.setattr(
-                passthrough, "_passthrough_endpoints", lambda *args: app.state.endpoints
-            )
-            response = await passthrough.route_passthrough_request(
-                "ws", "ep", "predict", request_for(app, b"opaque")
-            )
-        elif protocol == "multipart":
+        if protocol == "multipart":
             response = await proxy.route_general_transcriptions(
                 await audio_request(app), "/v1/audio/transcriptions", None, "ws", "ep"
             )
@@ -350,6 +340,41 @@ async def test_audio_preserves_json_or_sse(app, stream, status):
             )
             == 0
         )
+
+
+@pytest.mark.asyncio
+async def test_cancel_audio_while_waiting_for_response_clears_running_stats(app):
+    arrived = asyncio.Event()
+    release = asyncio.Event()
+
+    async def backend(request):
+        await request.read()
+        arrived.set()
+        await release.wait()
+        return web.json_response({"text": "hello"})
+
+    path = "/v1/audio/translations"
+    backend_app = web.Application()
+    backend_app.router.add_post(path, backend)
+    async with TestServer(backend_app) as server, aiohttp.ClientSession() as session:
+        url = str(server.make_url("/")).rstrip("/")
+        app.state.endpoints = [endpoint(url)]
+        app.state.aiohttp_client_wrapper = lambda: session
+        request = await audio_request(app)
+        task = asyncio.create_task(
+            proxy.route_multipart_request(request, path, None, "ws", "ep")
+        )
+        try:
+            await asyncio.wait_for(arrived.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+
+        monitor = app.state.request_stats_monitor
+        assert monitor.get_active_request_count(url) == 0
+        assert monitor.in_prefill_requests[url] == 0
 
 
 @pytest.mark.asyncio

@@ -69,7 +69,7 @@ continues to identify the Router Pod. Request statistics remain indexed by URL,
 so reuse of a backend URL can briefly attribute the existing window to a new Pod.
 
 `/metrics` also exports `router:connection_pool_waiting` with these labels for
-JSON, multipart audio, and passthrough requests. It counts calls waiting for an
+JSON and multipart audio requests. It counts calls waiting for an
 aiohttp connection slot, including cleanup on connection timeout or cancellation.
 It is separate from the inference engine's scheduler queue. Each Router has its
 own pool; preserve the Router instance when diagnosing sustained waiting.

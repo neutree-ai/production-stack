@@ -309,7 +309,9 @@ class RequestStatsMonitor(metaclass=SingletonMeta):
                 avg_dec_len = -1
 
             if engine_url in self.latency_monitors:
-                avg_lat = self.latency_monitors[engine_url].get_average()
+                latency_monitor = self.latency_monitors[engine_url]
+                latency_monitor.update_no_value(current_time)
+                avg_lat = latency_monitor.get_average()
             else:
                 avg_lat = -1
 

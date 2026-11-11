@@ -818,6 +818,11 @@ async def proxy_multipart_request(
                     selected.pod_name or "",
                 ),
             )
+        except asyncio.CancelledError:
+            monitor.on_request_complete(
+                chosen_url, stats_id, time.time(), success=False
+            )
+            raise
         except Exception:
             monitor.on_request_complete(
                 chosen_url, stats_id, time.time(), success=False
