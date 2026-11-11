@@ -12,7 +12,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import FormData, UploadFile
 
-from vllm_router.routers.routing_logic import PrefixAwareRouter, RoundRobinRouter
+from vllm_router.routers.routing_logic import RoundRobinRouter
 from vllm_router.services.metrics_service.forwarding import (
     connection_pool_waiting,
     create_trace_config,
@@ -110,7 +110,6 @@ async def test_json_input_api_preserves_payload_and_scoped_selection(app):
     async with TestServer(backend_app) as server, aiohttp.ClientSession() as session:
         app.state.endpoints = [endpoint(str(server.make_url("/")).rstrip("/"))]
         app.state.aiohttp_client_wrapper = lambda: session
-        app.state.router = PrefixAwareRouter()
         payload = {"model": "m", "input": ["hello"], "encoding_format": "float"}
         body = json.dumps(payload).encode()
         response = await proxy.route_general_request(
@@ -178,16 +177,8 @@ async def test_new_json_routes_reject_invalid_model_payload(app, body):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "path,async_router",
-    [
-        ("/v1/audio/transcriptions", False),
-        ("/v1/audio/translations", True),
-    ],
-)
-async def test_audio_fields_raw_translation_and_text_error(app, path, async_router):
-    if async_router:
-        app.state.router = PrefixAwareRouter()
+@pytest.mark.parametrize("path", ["/v1/audio/transcriptions", "/v1/audio/translations"])
+async def test_audio_fields_raw_translation_and_text_error(app, path):
     route = (
         proxy.route_multipart_request
         if path.endswith("translations")
