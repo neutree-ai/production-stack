@@ -145,6 +145,8 @@ class EngineStatsScraper(metaclass=SingletonMeta):
         endpoints = get_service_discovery().get_endpoint_info()
         logger.info(f"Scraping metrics from {len(endpoints)} serving engine(s)")
         for info in endpoints:
+            if info.passthrough:
+                continue
             url = info.url
             engine_stats = self._scrape_one_endpoint(url)
             if engine_stats:

@@ -325,7 +325,7 @@ async def route_general_request(
 
     # Track all valid incoming requests
     num_incoming_requests_total.labels(
-        workspace=workspace, endpoint=endpoint_name
+        workspace=workspace or "", endpoint=endpoint_name or ""
     ).inc()
 
     if not endpoints:

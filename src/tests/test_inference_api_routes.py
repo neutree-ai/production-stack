@@ -119,11 +119,15 @@ async def test_json_input_api_preserves_payload_and_scoped_selection(app):
         assert response.status_code == 422
         assert await response_body(response) == b"invalid input"
         assert response.headers["content-type"].startswith("text/plain")
+        global_response = await proxy.route_general_request(
+            request_for(app, body), "/pooling", None
+        )
+        assert global_response.status_code == 422
         denied = await proxy.route_general_request(
             request_for(app, body), "/pooling", None, "other", "ep"
         )
         assert denied.status_code == 404
-        assert received == [payload]
+        assert received == [payload, payload]
 
 
 @pytest.mark.asyncio
