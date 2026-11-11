@@ -97,13 +97,16 @@ async def route_embeddings(
     )
 
 
-# Upstream vllm-project/production-stack#1112 (4955696), with Neutree's scope.
+# Keep the upstream global route and add the scoped alias to the same handler.
+@main_router.post("/pooling")
 @main_router.post("/{workspace}/{endpoint}/pooling")
-async def route_pooling(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
-):
+async def route_pooling(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(
-        request, "/pooling", background_tasks, workspace, endpoint
+        request,
+        "/pooling",
+        background_tasks,
+        request.path_params.get("workspace"),
+        request.path_params.get("endpoint"),
     )
 
 
@@ -116,12 +119,15 @@ async def route_classification(
     )
 
 
+@main_router.post("/v1/audio/translations")
 @main_router.post("/{workspace}/{endpoint}/v1/audio/translations")
-async def route_audio_translations(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
-):
+async def route_audio_translations(request: Request, background_tasks: BackgroundTasks):
     return await route_multipart_request(
-        request, "/v1/audio/translations", background_tasks, workspace, endpoint
+        request,
+        "/v1/audio/translations",
+        background_tasks,
+        request.path_params.get("workspace"),
+        request.path_params.get("endpoint"),
     )
 
 
@@ -340,15 +346,16 @@ async def health() -> Response:
 
 
 # Extend the existing transcription endpoint with Neutree's required scope.
+@main_router.post("/v1/audio/transcriptions")
 @main_router.post("/{workspace}/{endpoint}/v1/audio/transcriptions")
 async def route_v1_audio_transcriptions(
-    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+    request: Request, background_tasks: BackgroundTasks
 ):
     """Handles audio transcription requests."""
     return await route_general_transcriptions(
         request,
         "/v1/audio/transcriptions",
         background_tasks,
-        workspace,
-        endpoint,
+        request.path_params.get("workspace"),
+        request.path_params.get("endpoint"),
     )
