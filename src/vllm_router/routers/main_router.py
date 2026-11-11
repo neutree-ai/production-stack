@@ -97,16 +97,12 @@ async def route_embeddings(
     )
 
 
-# Keep the upstream global route and add the scoped alias to the same handler.
-@main_router.post("/pooling")
 @main_router.post("/{workspace}/{endpoint}/pooling")
-async def route_pooling(request: Request, background_tasks: BackgroundTasks):
+async def route_pooling(
+    workspace: str, endpoint: str, request: Request, background_tasks: BackgroundTasks
+):
     return await route_general_request(
-        request,
-        "/pooling",
-        background_tasks,
-        request.path_params.get("workspace"),
-        request.path_params.get("endpoint"),
+        request, "/pooling", background_tasks, workspace, endpoint
     )
 
 
