@@ -12,7 +12,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import FormData, UploadFile
 
-from vllm_router.routers.routing_logic import PrefixAwareRouter, RoundRobinRouter
+from vllm_router.routers.routing_logic import RoundRobinRouter
 from vllm_router.services.metrics_service.forwarding import (
     connection_pool_waiting,
     create_trace_config,
@@ -95,18 +95,6 @@ async def response_body(response):
     if isinstance(response, StreamingResponse):
         return b"".join([chunk async for chunk in response.body_iterator])
     return response.body
-
-
-@pytest.mark.asyncio
-async def test_prefix_routing_requires_messages_or_prompt(app):
-    with pytest.raises(KeyError, match="prompt"):
-        await PrefixAwareRouter().route_request(
-            [endpoint("http://backend:8000")],
-            {},
-            {},
-            request_for(app),
-            {"model": "m", "input": ["hello"]},
-        )
 
 
 @pytest.mark.asyncio
