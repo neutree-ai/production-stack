@@ -98,6 +98,18 @@ async def response_body(response):
 
 
 @pytest.mark.asyncio
+async def test_prefix_routing_requires_messages_or_prompt(app):
+    with pytest.raises(KeyError, match="prompt"):
+        await PrefixAwareRouter().route_request(
+            [endpoint("http://backend:8000")],
+            {},
+            {},
+            request_for(app),
+            {"model": "m", "input": ["hello"]},
+        )
+
+
+@pytest.mark.asyncio
 async def test_json_input_api_preserves_payload_and_scoped_selection(app):
     received = []
 
@@ -110,7 +122,6 @@ async def test_json_input_api_preserves_payload_and_scoped_selection(app):
     async with TestServer(backend_app) as server, aiohttp.ClientSession() as session:
         app.state.endpoints = [endpoint(str(server.make_url("/")).rstrip("/"))]
         app.state.aiohttp_client_wrapper = lambda: session
-        app.state.router = PrefixAwareRouter()
         payload = {"model": "m", "input": ["hello"], "encoding_format": "float"}
         body = json.dumps(payload).encode()
         response = await proxy.route_general_request(
@@ -178,16 +189,8 @@ async def test_new_json_routes_reject_invalid_model_payload(app, body):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "path,async_router",
-    [
-        ("/v1/audio/transcriptions", False),
-        ("/v1/audio/translations", True),
-    ],
-)
-async def test_audio_fields_raw_translation_and_text_error(app, path, async_router):
-    if async_router:
-        app.state.router = PrefixAwareRouter()
+@pytest.mark.parametrize("path", ["/v1/audio/transcriptions", "/v1/audio/translations"])
+async def test_audio_fields_raw_translation_and_text_error(app, path):
     route = (
         proxy.route_multipart_request
         if path.endswith("translations")
