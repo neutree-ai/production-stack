@@ -38,10 +38,43 @@ The router can be configured using command-line arguments. Below are the availab
 - `--routing-logic`: The routing logic to use. Options are `roundrobin` or `session`. This option is required.
 - `--session-key`: The key (in the header) to identify a session.
 
+### Backend HTTP Options
+
+These options configure the existing aiohttp client at startup. Neutree supplies
+them as Router process arguments.
+
+| CLI option | Default | Meaning |
+| --- | --- | --- |
+| `--max-connections-per-backend` | `100` | Connection slots per host, per Router process; `0` is unlimited |
+| `--connect-timeout-seconds` | `60` | Connection acquisition, including pool waiting and establishing a connection |
+| `--sock-connect-timeout-seconds` | `10` | Socket connection establishment |
+| `--sock-read-timeout-seconds` | `600` | Idle wait for response headers or subsequent response data |
+
+There is no total request deadline. Continuous streaming may exceed these
+durations. Timeout values accept fractional seconds from `0` to `604800`, with
+`0` disabling that timeout. Connection limits are integers from `0` to `65535`.
+Omitted arguments use Router defaults; changing these four fields requires
+a process restart. Kubernetes discovery otherwise retains the fork baseline;
+no relist/reconnect or cache-during-outage fix is adopted from an unmerged PR.
+
 ### Monitoring Options
 
 - `--engine-stats-interval`: The interval in seconds to scrape engine statistics. Default is `30`.
 - `--request-stats-window`: The sliding window seconds to compute request statistics. Default is `60`.
+
+Backend Gauges use the labels `workspace`, `endpoint`, `server` (backend URL),
+and `replica` (inference Pod name). Static and Service-name discovery have no
+Pod identity and export an empty `replica`. The scrape target's `pod` label
+continues to identify the Router Pod. Request statistics remain indexed by URL,
+so reuse of a backend URL can briefly attribute the existing window to a new Pod.
+
+`/metrics` also exports `router:connection_pool_waiting` with these labels for
+JSON and multipart audio requests. It counts calls waiting for an
+aiohttp connection slot, including cleanup on connection timeout or cancellation.
+It is separate from the inference engine's scheduler queue. Each Router has its
+own pool; preserve the Router instance when diagnosing sustained waiting.
+Thirty-second scrapes may miss brief waiting spikes. Backend labels absent from
+discovery and inactive for five minutes are removed once no calls are waiting.
 
 ### Logging Options
 
@@ -104,6 +137,30 @@ different endpoints for each model type.
 
 > Enabling this flag will put some load on your backend every minute as real requests are send to the nodes
 > to test their functionality.
+
+## Additional scoped inference APIs
+
+| POST path | Backend path | Body |
+| --- | --- | --- |
+| `/{workspace}/{endpoint}/pooling` | `/pooling` | JSON object with `model` and task input |
+| `/{workspace}/{endpoint}/classify` | `/classify` | JSON object with `model` and task input |
+| `/{workspace}/{endpoint}/v1/audio/transcriptions` | `/v1/audio/transcriptions` | Multipart `file` and `model` |
+| `/{workspace}/{endpoint}/v1/audio/translations` | `/v1/audio/translations` | Multipart `file` and `model` |
+
+All four paths select backends within the requested workspace and endpoint.
+The existing transcription handler now exposes only the Neutree-scoped path.
+Transcription rebuilds the known fields supported by the merged upstream audio
+implementation, retaining the existing language=en default. Forwarding arbitrary
+additional transcription fields is not included. Translation preserves the
+original multipart body, including its repeated fields. As in merged upstream,
+transcription supports streaming; translation buffers its backend response.
+Audio responses preserve the backend status and content type. Requests use the
+same native HTTP configuration as other inference calls.
+The backend engine must support the requested task; adding a Router path does
+not add an engine task or a global model-routing entry.
+
+Static health checks also accept the `pooling`, `classification` and
+`translation` model types.
 
 ## Dynamic Router Config
 

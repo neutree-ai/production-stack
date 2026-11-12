@@ -459,12 +459,27 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         self.k8s_api = client.CoreV1Api()
         self.k8s_watcher = watch.Watch()
 
+        # Upstream #768: initialize watcher dependencies before starting its thread.
+        self.prefill_model_labels = prefill_model_labels
+        self.decode_model_labels = decode_model_labels
+        self.event_loop = None
+        self.event_loop_ready = threading.Event()
+
         # Start watching engines
         self.running = True
         self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
         self.watcher_thread.start()
-        self.prefill_model_labels = prefill_model_labels
-        self.decode_model_labels = decode_model_labels
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Attach the FastAPI loop and initialize engines discovered during startup."""
+        self.event_loop = loop
+        self.event_loop_ready.set()
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.initialize_client_sessions(), self.event_loop
+            )
+        except Exception as e:
+            logger.warning(f"Deferred client session init failed: {e}", exc_info=True)
 
     def _trigger_callbacks(
         self,
@@ -884,14 +899,19 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             endpoint_info,
         )
 
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self.initialize_client_sessions(),
-                self.app.state.event_loop,
+        if self.event_loop_ready.is_set() and self.event_loop is not None:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.initialize_client_sessions(),
+                    self.event_loop,
+                )
+                fut.result()
+            except Exception as e:
+                logger.error(f"Error initializing client sessions: {e}")
+        else:
+            logger.debug(
+                "Event loop not ready; deferring client session initialization"
             )
-            fut.result()
-        except Exception as e:
-            logger.error(f"Error initializing client sessions: {e}")
 
         # Track all models we've ever seen
         with self.known_models_lock:

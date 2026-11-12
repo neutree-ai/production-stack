@@ -34,6 +34,7 @@ from vllm_router.services.metrics_service import (
     num_requests_running,
     num_requests_swapped,
 )
+from vllm_router.services.metrics_service.forwarding import prune_forwarding_metrics
 from vllm_router.stats.engine_stats import get_engine_stats_scraper
 from vllm_router.stats.request_stats import get_request_stats_monitor
 
@@ -87,53 +88,47 @@ async def metrics():
     router_disk_usage_percent.set(disk_percent)
 
     endpoints = get_service_discovery().get_endpoint_info()
+    # generate_latest exports the hook-maintained queue gauge; do not reset active waits.
+    prune_forwarding_metrics(endpoints)
     stats = get_request_stats_monitor().get_request_stats(time.time())
     clear_endpoint_metrics()
     for ep in endpoints:
+        labels = {
+            "workspace": ep.workspace,
+            "endpoint": ep.endpoint,
+            "server": ep.url,
+            "replica": ep.pod_name or "",
+        }
         # set gpu cache metrics
         if get_engine_stats_scraper() is not None:
             engine_stat = get_engine_stats_scraper().engine_stats.get(ep.url, None)
             if engine_stat:
-                gpu_prefix_cache_hit_rate.labels(
-                    workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-                ).set(engine_stat.gpu_prefix_cache_hit_rate)
-                gpu_prefix_cache_hits_total.labels(
-                    workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-                ).set(engine_stat.gpu_prefix_cache_hits_total)
-                gpu_prefix_cache_queries_total.labels(
-                    workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-                ).set(engine_stat.gpu_prefix_cache_queries_total)
+                gpu_prefix_cache_hit_rate.labels(**labels).set(
+                    engine_stat.gpu_prefix_cache_hit_rate
+                )
+                gpu_prefix_cache_hits_total.labels(**labels).set(
+                    engine_stat.gpu_prefix_cache_hits_total
+                )
+                gpu_prefix_cache_queries_total.labels(**labels).set(
+                    engine_stat.gpu_prefix_cache_queries_total
+                )
         # set healthy_pods_total metric
-        healthy_pods_total.labels(
-            workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-        ).set(1 if getattr(ep, "healthy", True) else 0)
+        healthy_pods_total.labels(**labels).set(
+            1 if getattr(ep, "healthy", True) else 0
+        )
         # set request-related metrics
         stat = stats.get(ep.url, None)
         if stat:
-            current_qps.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.qps)
-            avg_decoding_length.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.avg_decoding_length)
-            num_prefill_requests.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.in_prefill_requests)
-            num_decoding_requests.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.in_decoding_requests)
-            num_requests_running.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.in_prefill_requests + stat.in_decoding_requests)
-            avg_latency.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.avg_latency)
-            avg_itl.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.avg_itl)
-            num_requests_swapped.labels(
-                workspace=ep.workspace, endpoint=ep.endpoint, server=ep.url
-            ).set(stat.num_swapped_requests)
+            current_qps.labels(**labels).set(stat.qps)
+            avg_decoding_length.labels(**labels).set(stat.avg_decoding_length)
+            num_prefill_requests.labels(**labels).set(stat.in_prefill_requests)
+            num_decoding_requests.labels(**labels).set(stat.in_decoding_requests)
+            num_requests_running.labels(**labels).set(
+                stat.in_prefill_requests + stat.in_decoding_requests
+            )
+            avg_latency.labels(**labels).set(stat.avg_latency)
+            avg_itl.labels(**labels).set(stat.avg_itl)
+            num_requests_swapped.labels(**labels).set(stat.num_swapped_requests)
 
     # Return all metrics in Prometheus format
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

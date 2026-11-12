@@ -16,6 +16,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 
+import aiohttp
 import sentry_sdk
 import uvicorn
 from fastapi import FastAPI
@@ -48,6 +49,7 @@ from vllm_router.service_discovery import (
 from vllm_router.services.batch_service import initialize_batch_processor
 from vllm_router.services.callbacks_service.callbacks import configure_custom_callbacks
 from vllm_router.services.files_service import initialize_storage
+from vllm_router.services.metrics_service.forwarding import create_trace_config
 from vllm_router.services.request_service.rewriter import (
     get_request_rewriter,
 )
@@ -87,37 +89,42 @@ logger = logging.getLogger("uvicorn")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.aiohttp_client_wrapper.start()
-    if hasattr(app.state, "batch_processor"):
-        await app.state.batch_processor.initialize()
+    # Upstream vllm-project/production-stack#768 (eb9526f): publish the loop early.
+    app.state.event_loop = asyncio.get_running_loop()
+    # Keep one client across discovery refreshes so in-flight calls keep their sockets.
+    app.state.aiohttp_client_wrapper.start(
+        timeout=app.state.aiohttp_timeout,
+        max_connections_per_backend=app.state.max_connections_per_backend,
+        trace_configs=[create_trace_config()],
+    )
+    try:
+        service_discovery = get_service_discovery()
+        if hasattr(service_discovery, "set_event_loop"):
+            service_discovery.set_event_loop(app.state.event_loop)
+        if hasattr(app.state, "batch_processor"):
+            await app.state.batch_processor.initialize()
 
-    service_discovery = get_service_discovery()
-    if hasattr(service_discovery, "initialize_client_sessions"):
-        await service_discovery.initialize_client_sessions()
+        if hasattr(service_discovery, "initialize_client_sessions"):
+            await service_discovery.initialize_client_sessions()
 
-    app.state.event_loop = asyncio.get_event_loop()
+        yield
+    finally:
+        # Stop background reconfiguration and scheduling before closing the client.
+        dyn_cfg_watcher = get_dynamic_config_watcher()
+        if dyn_cfg_watcher is not None:
+            logger.info("Closing dynamic config watcher")
+            dyn_cfg_watcher.close()
 
-    yield
-    await app.state.aiohttp_client_wrapper.stop()
+        logger.info("Closing engine stats scraper")
+        if app.state.engine_stats_scraper is not None:
+            app.state.engine_stats_scraper.close()
 
-    # Close the threaded-components
-    logger.info("Closing engine stats scraper")
-    if app.state.engine_stats_scraper is not None:
-        app.state.engine_stats_scraper.close()
+        logger.info("Closing service discovery module")
+        get_service_discovery().close()
+        await app.state.aiohttp_client_wrapper.stop()
 
-    logger.info("Closing service discovery module")
-    service_discovery = get_service_discovery()
-    service_discovery.close()
-
-    # Close the optional dynamic config watcher
-    dyn_cfg_watcher = get_dynamic_config_watcher()
-    if dyn_cfg_watcher is not None:
-        logger.info("Closing dynamic config watcher")
-        dyn_cfg_watcher.close()
-
-    # Close routing logic instances
-    logger.info("Closing routing logic instances")
-    cleanup_routing_logic()
+        logger.info("Closing routing logic instances")
+        cleanup_routing_logic()
 
 
 def initialize_all(app: FastAPI, args):
@@ -131,6 +138,14 @@ def initialize_all(app: FastAPI, args):
     Raises:
         ValueError: if the service discovery type is invalid
     """
+    app.state.aiohttp_timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=args.connect_timeout_seconds or None,
+        sock_connect=args.sock_connect_timeout_seconds or None,
+        sock_read=args.sock_read_timeout_seconds or None,
+    )
+    app.state.max_connections_per_backend = args.max_connections_per_backend
+
     if sentry_dsn := args.sentry_dsn:
         sentry_sdk.init(
             dsn=sentry_dsn,

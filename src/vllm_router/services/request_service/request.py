@@ -15,14 +15,16 @@
 # --- Request Processing & Routing ---
 import asyncio
 import json
+import math
 import os
 import time
 import uuid
 from typing import Optional
 
 import aiohttp
-from fastapi import BackgroundTasks, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import BackgroundTasks, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import UploadFile
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
@@ -53,6 +55,7 @@ except ImportError:
     semantic_cache_available = False
 
 from vllm_router.services.metrics_service import num_incoming_requests_total
+from vllm_router.services.metrics_service.forwarding import trace_context
 
 logger = init_logger(__name__)
 
@@ -128,7 +131,9 @@ async def process_request(
             url=backend_url + endpoint,
             headers=headers,
             data=body,
-            timeout=aiohttp.ClientTimeout(total=None),
+            trace_request_ctx=trace_context(
+                *getattr(request.state, "backend_labels", ("", "", backend_url, ""))
+            ),
         ) as backend_response:
             # Yield headers and status code first.
             yield backend_response.headers, backend_response.status
@@ -158,6 +163,7 @@ async def process_request(
         exception_type = type(exc).__name__
         raise
     finally:
+        # Every exit releases active state; only a fully read response is completed.
         stage, active_after = request_stats_monitor.on_request_complete(
             backend_url, request_id, time.time(), success=success
         )
@@ -219,7 +225,16 @@ async def route_general_request(
     # Same as vllm, Get request_id from X-Request-Id header if available
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request_body = await request.body()
-    request_json = json.loads(request_body) if request_body else {}
+    try:
+        request_json = json.loads(request_body) if request_body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400, content={"error": "Request body must be a JSON object."}
+        )
+    if not isinstance(request_json, dict):
+        return JSONResponse(
+            status_code=400, content={"error": "Request body must be a JSON object."}
+        )
 
     if request.query_params:
         request_endpoint = request.query_params.get("id")
@@ -235,7 +250,7 @@ async def route_general_request(
         return response_overwrite
 
     requested_model = request_json.get("model", None)
-    if requested_model is None:
+    if not isinstance(requested_model, str) or not requested_model:
         return JSONResponse(
             status_code=400,
             content={"error": "Invalid request: missing 'model' in request body."},
@@ -310,7 +325,7 @@ async def route_general_request(
 
     # Track all valid incoming requests
     num_incoming_requests_total.labels(
-        workspace=workspace, endpoint=endpoint_name
+        workspace=workspace or "", endpoint=endpoint_name or ""
     ).inc()
 
     if not endpoints:
@@ -373,11 +388,18 @@ async def route_general_request(
     # Debug logging to help troubleshoot session ID extraction
     logger.debug(f"Debug session extraction - Router type: {type(router).__name__}")
     logger.debug(f"Debug session extraction - Session key config: {session_key}")
-    logger.debug(f"Debug session extraction - Request headers: {dict(request.headers)}")
     logger.debug(f"Debug session extraction - Extracted session ID: {session_id}")
 
     logger.info(
         f"Routing request {request_id} with session id {session_id_display} to {server_url} at {curr_time}, process time = {curr_time - in_router_time:.4f}"
+    )
+    selected = next(info for info in endpoints if info.url == server_url)
+    # Discovery may replace this backend before the request's queue hooks run.
+    request.state.backend_labels = (
+        selected.workspace or "",
+        selected.endpoint or "",
+        server_url,
+        selected.pod_name or "",
     )
     stream_generator = process_request(
         request,
@@ -387,7 +409,15 @@ async def route_general_request(
         endpoint,
         background_tasks,
     )
-    headers, status = await anext(stream_generator)
+    try:
+        headers, status = await anext(stream_generator)
+    except TimeoutError:
+        # Downstream headers have not been sent, so an early timeout can be a 504.
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Backend request timed out."},
+            headers={"X-Request-Id": request_id},
+        )
     headers_dict = {key: value for key, value in headers.items()}
     headers_dict["X-Request-Id"] = request_id
     return StreamingResponse(
@@ -606,172 +636,289 @@ async def route_sleep_wakeup_request(
             )
 
 
+# Merged upstream 7b1164d: shared audio forwarding; scope only changes selection.
 async def route_general_transcriptions(
     request: Request,
-    endpoint: str,  # "/v1/audio/transcriptions"
+    endpoint: str,
     background_tasks: BackgroundTasks,
+    workspace: str | None = None,
+    endpoint_name: str | None = None,
 ):
-    """Handles audio transcription requests by parsing form data and proxying to backend."""
-
-    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
-
-    # --- 1. Form parsing ---
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    form = await request.form()
     try:
-        form = await request.form()
-
-        # Extract parameters from the form data
-        file: UploadFile = form["file"]
-        model: str = form["model"]
-        prompt: Optional[str] = form.get("prompt", None)
-        response_format: Optional[str] = form.get("response_format", "json")
-        temperature_str: Optional[str] = form.get("temperature", None)
-        temperature: Optional[float] = (
-            float(temperature_str) if temperature_str is not None else None
-        )
-        language: Optional[str] = form.get("language", "en")
-    except KeyError as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Invalid request: missing '{e.args[0]}' in form data."},
-        )
-
-    logger.debug("==== Enter audio_transcriptions ====")
-    logger.debug("Received upload: %s (%s)", file.filename, file.content_type)
-    logger.debug(
-        "Params: model=%s prompt=%r response_format=%r temperature=%r language=%s",
-        model,
-        prompt,
-        response_format,
-        temperature,
-        language,
-    )
-
-    # --- 2. Service Discovery and Routing ---
-    # Access singletons via request.app.state for consistent style
-    service_discovery = (
-        get_service_discovery()
-    )  # This one is often still accessed directly via its get function
-    router = request.app.state.router  # Access router from app.state
-    request_stats_monitor = (
-        request.app.state.request_stats_monitor
-    )  # Access request_stats_monitor from app.state
-
-    endpoints = service_discovery.get_endpoint_info()
-
-    # filter the endpoints url by model name
-    transcription_endpoints = []
-    for ep in endpoints:
-        for model_name in ep.model_names:
-            if model == model_name and not ep.sleep:
-                transcription_endpoints.append(ep)
-
-    if not transcription_endpoints:
-        logger.error("No transcription backend available for model %s", model)
-        return JSONResponse(
-            status_code=404,
-            content={"error": f"No transcription backend for model {model}"},
-        )
-
-    # grab the current engine and request stats
-    # get engine stats and request stats
-    engine_stats = {}
-    if request.app.state.engine_stats_scraper is not None:
-        engine_stats = request.app.state.engine_stats_scraper.engine_stats
-    request_stats = request_stats_monitor.get_request_stats(time.time())
-
-    # pick one using the router's configured logic (roundrobin, least-loaded, etc.)
-    chosen_url = router.route_request(
-        transcription_endpoints,
-        engine_stats,
-        request_stats,
-        request,
-    )
-
-    logger.debug("Proxying transcription request to %s", chosen_url)
-
-    # --- 3. Prepare and Proxy the Request ---
-    payload_bytes = await file.read()
-    files = {"file": (file.filename, payload_bytes, file.content_type)}
-
-    data = {"model": model, "language": language}
-
-    if prompt:
-        data["prompt"] = prompt
-
-    if response_format:
-        data["response_format"] = response_format
-
-    if temperature is not None:
-        data["temperature"] = str(temperature)
-
-    logger.info("Proxying transcription request for model %s to %s", model, chosen_url)
-
-    try:
-        client = request.app.state.aiohttp_client_wrapper()
-
-        form_data = aiohttp.FormData()
-
-        # add file data
-        for key, (filename, content, content_type) in files.items():
-            form_data.add_field(
-                key, content, filename=filename, content_type=content_type
+        file = form.get("file")
+        model = form.get("model")
+        if not isinstance(file, UploadFile) or not isinstance(model, str) or not model:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "A file and non-empty model are required."},
+                headers={"X-Request-Id": request_id},
             )
-
-        # add from data
+        try:
+            temperature = float(form["temperature"]) if "temperature" in form else None
+            if temperature is not None and not math.isfinite(temperature):
+                raise ValueError()
+            # Retain the fork's default; merged upstream defaults to no language.
+            language = form.get("language", "en")
+            stream = str(form.get("stream", "false")).lower() == "true"
+            if not isinstance(language, str):
+                raise TypeError()
+        except (TypeError, ValueError):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid multipart/form-data request."},
+                headers={"X-Request-Id": request_id},
+            )
+        payload_bytes = await file.read()
+        form_data = aiohttp.FormData()
+        form_data.add_field(
+            "file",
+            payload_bytes,
+            filename=file.filename,
+            content_type=file.content_type,
+        )
+        data = {"model": model}
+        language = language.strip()
+        if language and language.lower() not in ("none", "null", "undefined"):
+            data["language"] = language
+        for key in ("prompt", "response_format"):
+            value = form.get(key, "json" if key == "response_format" else None)
+            if value:
+                if not isinstance(value, str):
+                    return JSONResponse(
+                        status_code=400, content={"error": f"{key} must be text."}
+                    )
+                data[key] = value
+        if temperature is not None:
+            data["temperature"] = str(temperature)
+        if stream:
+            data["stream"] = "true"
         for key, value in data.items():
             form_data.add_field(key, value)
-
-        backend_response = await client.post(
-            f"{chosen_url}{endpoint}",
-            data=form_data,
-            timeout=aiohttp.ClientTimeout(total=300),
+        return await proxy_multipart_request(
+            form_data,
+            model,
+            endpoint,
+            request,
+            stream=stream,
+            workspace=workspace,
+            endpoint_name=endpoint_name,
         )
+    finally:
+        await form.close()
 
-        # --- 4. Return the response ---
-        response_content = await backend_response.json()
-        headers = {
-            k: v
-            for k, v in backend_response.headers.items()
-            if k.lower() not in ("content-encoding", "transfer-encoding", "connection")
-        }
 
-        headers["X-Request-Id"] = request_id
+async def route_multipart_request(
+    request: Request,
+    endpoint: str,
+    background_tasks: BackgroundTasks,
+    workspace: str | None = None,
+    endpoint_name: str | None = None,
+):
+    # Raw translation keeps the original multipart bytes and its boundary.
+    body = await request.body()
+    form = await request.form()
+    try:
+        model = form.get("model")
+        if (
+            not isinstance(form.get("file"), UploadFile)
+            or not isinstance(model, str)
+            or not model
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "A file and non-empty model are required."},
+            )
+        return await proxy_multipart_request(
+            body,
+            model,
+            endpoint,
+            request,
+            workspace=workspace,
+            endpoint_name=endpoint_name,
+        )
+    finally:
+        await form.close()
 
+
+async def proxy_multipart_request(
+    form_data: bytes | aiohttp.FormData,
+    model: str,
+    endpoint: str,
+    request: Request,
+    *,
+    stream: bool = False,
+    workspace: str | None = None,
+    endpoint_name: str | None = None,
+):
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    monitor = request.app.state.request_stats_monitor
+    endpoints = [
+        info
+        for info in get_service_discovery().get_endpoint_info()
+        if model in info.model_names
+        and not info.sleep
+        and (workspace is None or info.workspace == workspace)
+        and (endpoint_name is None or info.endpoint == endpoint_name)
+    ]
+    if not endpoints:
         return JSONResponse(
-            content=response_content,
-            status_code=backend_response.status,
-            headers=headers,
+            status_code=404,
+            content={"error": f"No backend for model {model}"},
+            headers={"X-Request-Id": request_id},
         )
-    except aiohttp.ClientResponseError as response_error:
-        if response_error.response is not None:
-            try:
-                error_content = await response_error.response.json()
-            except (
-                aiohttp.ContentTypeError,
-                json.JSONDecodeError,
-                aiohttp.ClientError,
-            ):
-                # If JSON parsing fails, get text content
-                try:
-                    text_content = await response_error.response.text()
-                    error_content = {"error": text_content}
-                except aiohttp.ClientError:
-                    error_content = {
-                        "error": f"HTTP {response_error.status}: {response_error.message}"
-                    }
-        else:
-            error_content = {
-                "error": f"HTTP {response_error.status}: {response_error.message}"
+    router = (
+        get_routing_logic_by_type(
+            endpoints[0].routing_logic or RoutingLogic.ROUND_ROBIN
+        )
+        if workspace is not None
+        else request.app.state.router
+    )
+    scraper = request.app.state.engine_stats_scraper
+    engine_stats = scraper.engine_stats if scraper is not None else {}
+    stats = monitor.get_request_stats(time.time())
+    if isinstance(
+        router,
+        (
+            KvawareRouter,
+            PrefixAwareRouter,
+            SessionRouter,
+            ConsistentHashRouter,
+            StaticHashRouter,
+        ),
+    ):
+        chosen_url = await router.route_request(
+            endpoints, engine_stats, stats, request, {}
+        )
+    else:
+        chosen_url = router.route_request(endpoints, engine_stats, stats, request)
+    selected = next(info for info in endpoints if info.url == chosen_url)
+    try:
+        # Rebuilt forms need aiohttp's new boundary; raw multipart keeps its header.
+        headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() not in _HOP_BY_HOP_HEADERS
+            and key.lower() != "x-request-id"
+            and (isinstance(form_data, bytes) or key.lower() != "content-type")
+        }
+        headers["X-Request-Id"] = request_id
+        stats_id = str(uuid.uuid4())
+        monitor.on_new_request(chosen_url, stats_id, time.time())
+        try:
+            backend_response = await request.app.state.aiohttp_client_wrapper().post(
+                f"{chosen_url}{endpoint}",
+                data=form_data,
+                headers=headers,
+                trace_request_ctx=trace_context(
+                    selected.workspace or "",
+                    selected.endpoint or "",
+                    chosen_url,
+                    selected.pod_name or "",
+                ),
+            )
+        except asyncio.CancelledError:
+            monitor.on_request_complete(
+                chosen_url, stats_id, time.time(), success=False
+            )
+            raise
+        except Exception:
+            monitor.on_request_complete(
+                chosen_url, stats_id, time.time(), success=False
+            )
+            raise
+        resp_headers = {
+            key: value
+            for key, value in backend_response.headers.items()
+            if key.lower()
+            not in {
+                "content-length",
+                "content-encoding",
+                "transfer-encoding",
+                "connection",
+                "server",
             }
-        return JSONResponse(status_code=response_error.status, content=error_content)
-    except aiohttp.ClientError as client_error:
+        }
+        resp_headers["X-Request-Id"] = request_id
+        if stream:
+
+            async def traced_stream():
+                first_token = False
+                success = False
+                try:
+                    async for chunk in backend_response.content.iter_any():
+                        if not first_token:
+                            first_token = True
+                            monitor.on_request_response(
+                                chosen_url, stats_id, time.time()
+                            )
+                        if chunk:
+                            yield chunk
+                    success = True
+                finally:
+                    backend_response.close()
+                    monitor.on_request_complete(
+                        chosen_url, stats_id, time.time(), success=success
+                    )
+
+            return StreamingResponse(
+                traced_stream(),
+                status_code=backend_response.status,
+                headers=resp_headers,
+                media_type=backend_response.headers.get(
+                    "content-type", "text/event-stream"
+                ),
+            )
+        success = False
+        try:
+            monitor.on_request_response(chosen_url, stats_id, time.time())
+            media_type = (
+                backend_response.headers.get("content-type", "")
+                .partition(";")[0]
+                .strip()
+                .lower()
+            )
+            is_json = media_type == "application/json" or media_type.endswith("+json")
+            content = await (
+                backend_response.json() if is_json else backend_response.read()
+            )
+            success = True
+            response_type = JSONResponse if is_json else Response
+            return response_type(
+                content=content,
+                status_code=backend_response.status,
+                headers=resp_headers,
+            )
+        except (aiohttp.ContentTypeError, json.JSONDecodeError) as parse_error:
+            try:
+                text_content = await backend_response.text()
+            except aiohttp.ClientError:
+                text_content = str(parse_error)
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": f"Backend returned non-JSON response: {text_content}"
+                },
+                headers=resp_headers,
+            )
+        finally:
+            backend_response.close()
+            monitor.on_request_complete(
+                chosen_url, stats_id, time.time(), success=success
+            )
+    except TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Backend request timed out."},
+            headers={"X-Request-Id": request_id},
+        )
+    except aiohttp.ClientError:
         return JSONResponse(
             status_code=503,
-            content={"error": f"Failed to connect to backend: {str(client_error)}"},
+            content={"error": "Failed to connect to backend."},
+            headers={"X-Request-Id": request_id},
         )
-    except Exception as e:
-        logger.error(e)
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Internal server error"},
-        )
+    except Exception as exc:
+        logger.error(exc)
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})

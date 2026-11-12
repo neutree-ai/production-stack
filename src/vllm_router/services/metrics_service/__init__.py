@@ -5,47 +5,47 @@ from prometheus_client import Counter, Gauge
 num_requests_running = Gauge(
     "router:num_requests_running",
     "Number of running requests",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 num_requests_waiting = Gauge(
     "router:num_requests_waiting",
     "Number of waiting requests",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 gpu_prefix_cache_hit_rate = Gauge(
     "router:gpu_prefix_cache_hit_rate",
     "GPU Prefix Cache Hit Rate",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 gpu_prefix_cache_hits_total = Gauge(
     "router:gpu_prefix_cache_hits_total",
     "Total GPU Prefix Cache Hits",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 gpu_prefix_cache_queries_total = Gauge(
     "router:gpu_prefix_cache_queries_total",
     "Total GPU Prefix Cache Queries",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 current_qps = Gauge(
     "router:current_qps",
     "Current Queries Per Second",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 avg_decoding_length = Gauge(
     "router:avg_decoding_length",
     "Average Decoding Length",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 num_prefill_requests = Gauge(
     "router:num_prefill_requests",
     "Number of Prefill Requests",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 num_decoding_requests = Gauge(
     "router:num_decoding_requests",
     "Number of Decoding Requests",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 num_incoming_requests_total = Counter(
     "router:num_incoming_requests",
@@ -57,20 +57,22 @@ num_incoming_requests_total = Counter(
 healthy_pods_total = Gauge(
     "router:healthy_pods_total",
     "Number of healthy inference pods",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 avg_latency = Gauge(
     "router:avg_latency",
     "Average end-to-end request latency",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 avg_itl = Gauge(
-    "router:avg_itl", "Average Inter-Token Latency", ["workspace", "endpoint", "server"]
+    "router:avg_itl",
+    "Average Inter-Token Latency",
+    ["workspace", "endpoint", "server", "replica"],
 )
 num_requests_swapped = Gauge(
     "router:num_requests_swapped",
     "Number of swapped requests",
-    ["workspace", "endpoint", "server"],
+    ["workspace", "endpoint", "server", "replica"],
 )
 
 

@@ -15,7 +15,7 @@
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from fastapi import FastAPI
@@ -69,6 +69,12 @@ class DynamicRouterConfig:
     # Logging Options
     callbacks: Optional[str] = None
 
+    # Startup-only client settings are accepted but ignored by dynamic reloads.
+    max_connections_per_backend: int = field(default=100, compare=False)
+    connect_timeout_seconds: float = field(default=60, compare=False)
+    sock_connect_timeout_seconds: float = field(default=10, compare=False)
+    sock_read_timeout_seconds: float = field(default=600, compare=False)
+
     # Batch API configurations
     # TODO (ApostaC): Support dynamic reconfiguration of batch API
     # enable_batch_api: bool
@@ -99,6 +105,10 @@ class DynamicRouterConfig:
             session_key=args.session_key,
             # Logging Options
             callbacks=args.callbacks,
+            max_connections_per_backend=args.max_connections_per_backend,
+            connect_timeout_seconds=args.connect_timeout_seconds,
+            sock_connect_timeout_seconds=args.sock_connect_timeout_seconds,
+            sock_read_timeout_seconds=args.sock_read_timeout_seconds,
         )
 
     @staticmethod

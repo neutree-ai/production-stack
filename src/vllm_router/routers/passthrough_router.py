@@ -34,13 +34,13 @@ explicitly declared routes -- including the three-segment ones such as
 import uuid
 from typing import Dict, List, Tuple
 
-import aiohttp
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm_router.log import init_logger
 from vllm_router.service_discovery import EndpointInfo, get_service_discovery
 from vllm_router.services.metrics_service import num_incoming_requests_total
+from vllm_router.services.metrics_service.forwarding import trace_context
 from vllm_router.services.request_service.request import _HOP_BY_HOP_HEADERS
 
 passthrough_router = APIRouter()
@@ -49,10 +49,6 @@ logger = init_logger(__name__)
 
 # HEAD is omitted deliberately: Starlette adds it whenever GET is present.
 _PASSTHROUGH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-
-# One long-lived aiohttp timeout for every proxied request. Immutable, so it is
-# safe to share and pointless to rebuild per request.
-_NO_TIMEOUT = aiohttp.ClientTimeout(total=None)
 
 # Round-robin cursors, one per (workspace, endpoint). Passthrough workloads are
 # opaque to the router, so none of the OpenAI-aware strategies (prefix cache,
@@ -106,7 +102,7 @@ async def _stream_upstream(
         headers=headers,
         params=request.query_params.multi_items(),
         data=body,
-        timeout=_NO_TIMEOUT,
+        trace_request_ctx=trace_context(*request.state.backend_labels),
     ) as backend_response:
         yield backend_response.headers, backend_response.status
         async for chunk in backend_response.content.iter_any():
@@ -144,6 +140,12 @@ async def route_passthrough_request(
     num_incoming_requests_total.labels(workspace=workspace, endpoint=endpoint).inc()
 
     backend = _select_backend(endpoints, (workspace, endpoint))
+    request.state.backend_labels = (
+        backend.workspace or "",
+        backend.endpoint or "",
+        backend.url,
+        backend.pod_name or "",
+    )
     body = await request.body()
 
     logger.debug(
@@ -152,7 +154,14 @@ async def route_passthrough_request(
     )
 
     stream = _stream_upstream(request, backend.url, upstream_path, body)
-    upstream_headers, status = await anext(stream)
+    try:
+        upstream_headers, status = await anext(stream)
+    except TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"error": "Backend request timed out."},
+            headers={"X-Request-Id": request_id},
+        )
 
     # Strip hop-by-hop headers on the way back too. content-length in
     # particular must go: the response is re-framed as a stream, so a length

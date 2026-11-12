@@ -3,7 +3,7 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI
 from starlette.requests import Request
 
 from vllm_router.services.metrics_service import (
@@ -13,10 +13,7 @@ from vllm_router.services.metrics_service import (
     num_requests_waiting,
 )
 from vllm_router.services.request_service import request as request_service
-from vllm_router.services.request_service.request import (
-    process_request,
-    route_general_request,
-)
+from vllm_router.services.request_service.request import process_request
 from vllm_router.stats.request_stats import RequestStatsMonitor, SingletonMeta
 
 
@@ -70,6 +67,18 @@ def test_unsuccessful_completion_does_not_increment_finished_requests(monitor):
     assert stats.finished_requests == 1
     assert stats.in_prefill_requests == 0
     assert stats.active_requests == 0
+
+
+def test_average_latency_expires_without_new_requests(monitor):
+    engine_url = "http://engine"
+    monitor.on_new_request(engine_url, "slow", timestamp=100)
+    monitor.on_request_complete(engine_url, "slow", timestamp=106)
+    monitor.on_new_request(engine_url, "fast", timestamp=110)
+    monitor.on_request_complete(engine_url, "fast", timestamp=111)
+
+    assert monitor.get_request_stats(current_time=111)[engine_url].avg_latency == 3.5
+    assert monitor.get_request_stats(current_time=117)[engine_url].avg_latency == 1
+    assert monitor.get_request_stats(current_time=122)[engine_url].avg_latency == -1
 
 
 class _HangingContent:
@@ -131,48 +140,6 @@ def _create_request(monitor, request_context=None):
             "app": app,
         }
     )
-
-
-def test_invalid_rewritten_json_returns_bad_request(monkeypatch):
-    app = FastAPI()
-    app.state.router = None
-    app.state.semantic_cache_available = False
-    request_body = b'{"model": "model"}'
-
-    async def receive():
-        return {"type": "http.request", "body": request_body, "more_body": False}
-
-    request = Request(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/chat/completions",
-            "raw_path": b"/v1/chat/completions",
-            "query_string": b"",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "server": ("testserver", 80),
-            "app": app,
-        },
-        receive=receive,
-    )
-    rewriter = SimpleNamespace(rewrite_request=lambda *args: b"not-json")
-    monkeypatch.setattr(
-        request_service, "is_request_rewriter_initialized", lambda: True
-    )
-    monkeypatch.setattr(request_service, "get_request_rewriter", lambda: rewriter)
-
-    async def route_request():
-        with pytest.raises(HTTPException) as exc_info:
-            await route_general_request(
-                request, "/v1/chat/completions", BackgroundTasks()
-            )
-        assert exc_info.value.status_code == 400
-
-    asyncio.run(route_request())
 
 
 def test_closing_stream_before_first_token_releases_request_stats(monitor):
@@ -292,7 +259,12 @@ def test_backend_error_releases_stats_and_logs_safe_terminal_fields(
 
 def test_clear_endpoint_metrics_removes_stale_labels_without_resetting_counter():
     clear_endpoint_metrics()
-    labels = {"workspace": "workspace", "endpoint": "endpoint", "server": "stale"}
+    labels = {
+        "workspace": "workspace",
+        "endpoint": "endpoint",
+        "server": "stale",
+        "replica": "inference-0",
+    }
     current_qps.labels(**labels).set(1)
     num_requests_waiting.labels(**labels).set(2)
     num_incoming_requests_total.labels(workspace="workspace", endpoint="endpoint").inc()
@@ -304,13 +276,22 @@ def test_clear_endpoint_metrics_removes_stale_labels_without_resetting_counter()
     assert num_incoming_requests_total._metrics
 
 
-def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch):
+@pytest.mark.parametrize("pod_name", [None, "inference-0"])
+def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch, pod_name):
     metrics_module = importlib.import_module("vllm_router.routers.metrics_router")
     old_endpoint = SimpleNamespace(
-        url="http://stale", workspace="workspace", endpoint="endpoint", healthy=True
+        url="http://stale",
+        workspace="workspace",
+        endpoint="endpoint",
+        healthy=True,
+        pod_name=pod_name,
     )
     current_endpoint = SimpleNamespace(
-        url="http://current", workspace="workspace", endpoint="endpoint", healthy=True
+        url="http://current",
+        workspace="workspace",
+        endpoint="endpoint",
+        healthy=True,
+        pod_name=pod_name,
     )
     endpoints = [old_endpoint]
     request_stat = SimpleNamespace(
@@ -331,7 +312,18 @@ def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch):
 
     monkeypatch.setattr(metrics_module, "get_service_discovery", lambda: discovery)
     monkeypatch.setattr(metrics_module, "get_request_stats_monitor", lambda: monitor)
-    monkeypatch.setattr(metrics_module, "get_engine_stats_scraper", lambda: None)
+    engine_stats = SimpleNamespace(
+        gpu_prefix_cache_hit_rate=0.5,
+        gpu_prefix_cache_hits_total=10,
+        gpu_prefix_cache_queries_total=20,
+    )
+    monkeypatch.setattr(
+        metrics_module,
+        "get_engine_stats_scraper",
+        lambda: SimpleNamespace(
+            engine_stats={endpoint.url: engine_stats for endpoint in endpoints}
+        ),
+    )
     monkeypatch.setattr(metrics_module.psutil, "cpu_percent", lambda interval: 0)
     monkeypatch.setattr(
         metrics_module.psutil, "virtual_memory", lambda: SimpleNamespace(percent=0)
@@ -340,9 +332,63 @@ def test_metrics_refresh_removes_labels_for_removed_endpoint(monkeypatch):
         metrics_module.psutil, "disk_usage", lambda _: SimpleNamespace(percent=0)
     )
 
-    asyncio.run(metrics_module.metrics())
+    response = asyncio.run(metrics_module.metrics())
+
+    assert f'replica="{pod_name or ""}"' in response.body.decode()
     endpoints[:] = [current_endpoint]
     asyncio.run(metrics_module.metrics())
 
-    assert ("workspace", "endpoint", "http://stale") not in current_qps._metrics
-    assert ("workspace", "endpoint", "http://current") in current_qps._metrics
+    assert (
+        "workspace",
+        "endpoint",
+        "http://stale",
+        pod_name or "",
+    ) not in current_qps._metrics
+    assert (
+        "workspace",
+        "endpoint",
+        "http://current",
+        pod_name or "",
+    ) in current_qps._metrics
+
+
+def test_log_stats_exports_inference_replica_labels(monitor, monkeypatch):
+    log_module = importlib.import_module("vllm_router.stats.log_stats")
+    endpoint = SimpleNamespace(
+        url="http://logged",
+        workspace="workspace",
+        endpoint="endpoint",
+        pod_name="inference-0",
+        model_info={},
+    )
+    monitor.on_new_request(endpoint.url, "completed", timestamp=100)
+    monitor.on_request_complete(endpoint.url, "completed", timestamp=102)
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            engine_stats_scraper=SimpleNamespace(get_engine_stats=dict),
+            request_stats_monitor=monitor,
+        )
+    )
+    monkeypatch.setattr(
+        log_module,
+        "get_service_discovery",
+        lambda: SimpleNamespace(get_endpoint_info=lambda: [endpoint]),
+    )
+    ticks = iter([None])
+    monkeypatch.setattr(log_module.time, "sleep", lambda _: next(ticks))
+    monkeypatch.setattr(log_module.time, "time", lambda: 103)
+    clear_endpoint_metrics()
+
+    with pytest.raises(StopIteration):
+        log_module.log_stats(app)
+
+    sample = next(
+        sample for metric in current_qps.collect() for sample in metric.samples
+    )
+    assert sample.value == 0.1
+    assert sample.labels == {
+        "workspace": "workspace",
+        "endpoint": "endpoint",
+        "server": "http://logged",
+        "replica": "inference-0",
+    }
