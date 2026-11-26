@@ -1,10 +1,11 @@
 import asyncio
 import importlib
+import time
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 
 from vllm_router.services.metrics_service import (
     clear_endpoint_metrics,
@@ -94,10 +95,13 @@ class _FakeBackendResponse:
 
 
 class _FakeRequestContext:
+    closed = False
+
     async def __aenter__(self):
         return _FakeBackendResponse()
 
     async def __aexit__(self, exc_type, exc_value, traceback):
+        self.closed = True
         return False
 
 
@@ -216,6 +220,54 @@ def test_cancelling_stream_releases_request_stats(monitor):
     assert stats.in_decoding_requests == 0
     assert stats.active_requests == 0
     assert stats.finished_requests == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec_version, failure",
+    [("2.3", "disconnect"), ("2.3", "send_error"), ("2.4", "send_error")],
+)
+async def test_response_send_failure_closes_backend_and_releases_stats(
+    monitor, spec_version, failure
+):
+    context = _FakeRequestContext()
+    request = _create_request(monitor, context)
+    generator = process_request(
+        request, b'{"stream": true}', "http://engine", "stream", "/v1/completions", None
+    )
+    headers, status = await anext(generator)
+    response = request_service._ProxyStreamingResponse(
+        generator, status_code=status, headers=headers
+    )
+    sending = asyncio.Event()
+
+    async def receive():
+        await sending.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            if failure == "send_error":
+                raise OSError("Client socket closed")
+            sending.set()
+            await asyncio.Event().wait()
+
+    scope = {**request.scope, "asgi": {"spec_version": spec_version}}
+    try:
+        call = asyncio.wait_for(response(scope, receive, send), timeout=5)
+        if failure == "send_error":
+            with pytest.raises((ClientDisconnect, ExceptionGroup)):
+                await call
+        else:
+            await call
+        assert context.closed
+        stats = monitor.get_request_stats(current_time=time.time())["http://engine"]
+        assert stats.in_prefill_requests == 0
+        assert stats.in_decoding_requests == 0
+        assert stats.active_requests == 0
+        assert stats.finished_requests == 0
+    finally:
+        await generator.aclose()
 
 
 def test_backend_error_releases_stats_and_logs_safe_terminal_fields(

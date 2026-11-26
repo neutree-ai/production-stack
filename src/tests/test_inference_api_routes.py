@@ -10,6 +10,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from fastapi import Request
 from fastapi.responses import StreamingResponse
+from prometheus_client import REGISTRY
 from starlette.datastructures import FormData, UploadFile
 
 from vllm_router.routers.routing_logic import RoundRobinRouter
@@ -62,8 +63,14 @@ def endpoint(url):
     )
 
 
-def request_for(app, body=b"", headers=None):
+def request_for(app, body=b"", headers=None, *, disconnected=None):
     headers = headers or {"content-type": "application/json"}
+    disconnected = disconnected or asyncio.Event()
+
+    async def receive():
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
     request = Request(
         {
             "type": "http",
@@ -74,7 +81,8 @@ def request_for(app, body=b"", headers=None):
                 (key.encode(), value.encode()) for key, value in headers.items()
             ],
             "app": app,
-        }
+        },
+        receive=receive,
     )
     request._body = body
     return request
@@ -165,6 +173,88 @@ async def test_forwarding_metrics_identify_the_selected_inference_replica(
                 "replica": "inference-0",
             }
         ] == [0]
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_request_releases_pool_and_allows_recovery(app):
+    release_holder = asyncio.Event()
+    queued = asyncio.Event()
+    disconnected = asyncio.Event()
+    hits = []
+
+    async def backend(request):
+        hits.append(request.path)
+        if request.path == "/holder":
+            response = web.StreamResponse()
+            await response.prepare(request)
+            await release_holder.wait()
+            return response
+        return web.json_response({"ok": True})
+
+    async def queue_started(*args):
+        queued.set()
+
+    backend_app = web.Application()
+    backend_app.router.add_post("/{path}", backend)
+    trace = create_trace_config()
+    trace.on_connection_queued_start.append(queue_started)
+    async with (
+        TestServer(backend_app) as server,
+        aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=1), trace_configs=[trace]
+        ) as session,
+    ):
+        base = str(server.make_url("/")).rstrip("/")
+        app.state.endpoints = [endpoint(base)]
+        app.state.aiohttp_client_wrapper = lambda: session
+        monitor = app.state.request_stats_monitor
+        labels = {
+            "workspace": "ws",
+            "endpoint": "ep",
+            "server": base,
+            "replica": "inference-0",
+        }
+        holder = await proxy.route_general_request(
+            request_for(app, b'{"model":"m"}'), "/holder", None, "ws", "ep"
+        )
+        task = asyncio.create_task(
+            proxy.route_general_request(
+                request_for(app, b'{"model":"m"}', disconnected=disconnected),
+                "/queued",
+                None,
+                "ws",
+                "ep",
+            )
+        )
+        try:
+            await asyncio.wait_for(queued.wait(), timeout=5)
+            assert monitor.get_active_request_count(base) == 2
+            assert (
+                REGISTRY.get_sample_value("router:connection_pool_waiting", labels) == 1
+            )
+
+            disconnected.set()
+            response = await asyncio.wait_for(task, timeout=5)
+            assert response.status_code == 499
+            assert monitor.get_active_request_count(base) == 1
+            assert (
+                REGISTRY.get_sample_value("router:connection_pool_waiting", labels) == 0
+            )
+
+            release_holder.set()
+            await response_body(holder)
+            recovery = await proxy.route_general_request(
+                request_for(app, b'{"model":"m"}'), "/recovery", None, "ws", "ep"
+            )
+            assert recovery.status_code == 200
+            assert json.loads(await response_body(recovery)) == {"ok": True}
+            assert hits == ["/holder", "/recovery"]
+            assert monitor.get_active_request_count(base) == 0
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            release_holder.set()
+            await holder.body_iterator.aclose()
 
 
 @pytest.mark.asyncio

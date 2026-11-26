@@ -22,9 +22,11 @@ import uuid
 from typing import Optional
 
 import aiohttp
+import anyio
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.datastructures import UploadFile
+from starlette.requests import ClientDisconnect
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
@@ -70,6 +72,68 @@ _HOP_BY_HOP_HEADERS = {
     "te",  # codespell:ignore
     "trailer",
 }
+
+
+async def _listen_for_disconnect(request: Request) -> None:
+    """Return once the client sends an ASGI disconnect message."""
+    while True:
+        if (await request.receive())["type"] == "http.disconnect":
+            return
+
+
+async def _cancel_and_wait(task: asyncio.Task) -> None:
+    """Cancel a task and wait for its cleanup without hiding caller cancellation."""
+    current = asyncio.current_task()
+    pending_before = current.cancelling() if current else 0
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        if current is not None and current.cancelling() > pending_before:
+            raise
+    except Exception:
+        # A backend error racing the disconnect cannot be returned to this client.
+        pass
+
+
+async def _anext_or_disconnect(stream_generator, request: Request):
+    """Wait for backend headers or cancel the backend when the client disconnects."""
+    headers_task = asyncio.create_task(anext(stream_generator))
+    disconnect_task = asyncio.create_task(_listen_for_disconnect(request))
+    received_headers = False
+    try:
+        await asyncio.wait(
+            (headers_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if headers_task.done():
+            received_headers = True
+            return headers_task.result()
+        raise ClientDisconnect()
+    finally:
+        try:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await _cancel_and_wait(disconnect_task)
+                finally:
+                    if not headers_task.done():
+                        await _cancel_and_wait(headers_task)
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await stream_generator.aclose()
+            raise
+        if not received_headers:
+            with anyio.CancelScope(shield=True):
+                await stream_generator.aclose()
+
+
+class _ProxyStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # ASGI send can fail while the upstream generator is suspended at yield.
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
 
 
 # TODO: (Brian) check if request is json beforehand
@@ -410,7 +474,9 @@ async def route_general_request(
         background_tasks,
     )
     try:
-        headers, status = await anext(stream_generator)
+        headers, status = await _anext_or_disconnect(stream_generator, request)
+    except ClientDisconnect:
+        return Response(status_code=499)
     except TimeoutError:
         # Downstream headers have not been sent, so an early timeout can be a 504.
         return JSONResponse(
@@ -420,7 +486,7 @@ async def route_general_request(
         )
     headers_dict = {key: value for key, value in headers.items()}
     headers_dict["X-Request-Id"] = request_id
-    return StreamingResponse(
+    return _ProxyStreamingResponse(
         stream_generator,
         status_code=status,
         headers=headers_dict,
